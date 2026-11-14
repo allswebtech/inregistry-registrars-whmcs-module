@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/allswebtech/inregistry-registrars-whmcs-module/security/advisories/new
+    about: Please report security problems privately, not as a public issue.
+  - name: Registry accounts, certificates and OT&E access
+    url: https://support.tucowsregistry.com/support/solutions/201000106008
+    about: Questions about your registrar account are answered by the registry, not by this project.

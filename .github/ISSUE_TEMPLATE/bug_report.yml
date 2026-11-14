@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in the module does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove EPP passwords, auth codes, certificates and personal data from everything you paste.
+        Security problems: please use "Report a vulnerability" on the Security tab instead.
+  - type: input
+    id: module
+    attributes:
+      label: Module version
+      description: The "version" in modules/registrars/inregistry/whmcs.json, or the commit you installed
+    validations:
+      required: true
+  - type: input
+    id: whmcs
+    attributes:
+      label: WHMCS version
+    validations:
+      required: true
+  - type: input
+    id: php
+    attributes:
+      label: PHP version
+    validations:
+      required: true
+  - type: dropdown
+    id: env
+    attributes:
+      label: Registry environment
+      options:
+        - OT&E (test)
+        - Production
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you do, and what happened?
+      description: The WHMCS action (register, transfer, renew, save nameservers, ...) and the exact error text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Module Log entry
+      description: Configuration → System Logs → Module Log. Paste the request and the response for the failing action.
+      render: xml
