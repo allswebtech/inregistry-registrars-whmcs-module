@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Test-only wrapper: loads every EPP schema so one schemaValidate() call
+     checks a whole document, <extension> content included. Order matters:
+     the official schemas import each other without schemaLocation. -->
+<schema xmlns="http://www.w3.org/2001/XMLSchema"
+        targetNamespace="urn:allsweb:test:epp-all"
+        elementFormDefault="qualified">
+  <import namespace="urn:ietf:params:xml:ns:eppcom-1.0" schemaLocation="eppcom-1.0.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:epp-1.0" schemaLocation="epp-1.0.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:host-1.0" schemaLocation="host-1.0.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:domain-1.0" schemaLocation="domain-1.0.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:contact-1.0" schemaLocation="contact-1.0.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:secDNS-1.1" schemaLocation="secDNS-1.1.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:rgp-1.0" schemaLocation="rgp-1.0.xsd"/>
+  <import namespace="urn:ietf:params:xml:ns:epp:loginSec-1.0" schemaLocation="loginSec-1.0.xsd"/>
+</schema>

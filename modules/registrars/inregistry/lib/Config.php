@@ -1,40 +1,43 @@
 <?php
 
-if (!defined("OKEPP_DEBUG_MODE")) {
-    define("OKEPP_DEBUG_MODE", false); // if true -> Development Mode and Error log showing on display and write on Error Path
-}
+namespace AllsWeb\InRegistry;
 
-if (!defined("LOGS_DIR")) {
-    define("LOGS_DIR", __DIR__ . "/../logs"); // Log path
-}
-
-if (function_exists("logModuleCall") && !defined("OKEPP_MODULE")) {
-    define("OKEPP_MODULE", "inregistry"); //Module Names
-}
-
-ini_set("error_log", LOGS_DIR . '/epp_error.log');
-ini_set('error_reporting', E_ALL);
-ini_set('display_errors', OKEPP_DEBUG_MODE); //
+const VERSION = '2.0.0';
+const MODULE = 'inregistry';
 
 require_once __DIR__ . '/Helper.php';
 require_once __DIR__ . '/EppClient.php';
 
+/**
+ * Connection settings for EppClient, built from the WHMCS registrar settings.
+ */
 function ok_epp_buildConfig(array $config)
 {
+    $crypto = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
+    if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT')) {
+        $crypto |= STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT;
+    }
+
     return [
-        "host" => !empty($config["TestMode"]) ? "epp.ote.nixiregistry.in" : "epp.nixiregistry.in",
-        "port" => 700, // System port number 700 has been assigned by the IANA for mapping EPP onto TCP
-        'local_cert' => $config['local_cert'],
-        'local_pk' => $config['local_pk'],
-        'passphrase' => $config['passphrase'],
-        "identityprefix" => $config['identityprefix'], //use as indentifer alls request and max length is 4
-        "tls_version" => "1.2", // Use more secure TLS 1.3 if the registry supports it.
+        'host' => !empty($config['TestMode']) ? 'epp.ote.nixiregistry.in' : 'epp.nixiregistry.in',
+        'port' => 700, // IANA-assigned EPP port (RFC 5734)
+        'crypto_method' => $crypto,
+        'local_cert' => trim((string) ($config['local_cert'] ?? '')),
+        'local_pk' => trim((string) ($config['local_pk'] ?? '')),
+        'passphrase' => (string) ($config['passphrase'] ?? ''),
+        'cafile' => trim((string) ($config['cafile'] ?? '')),
+        'identityprefix' => (string) ($config['identityprefix'] ?? ''),
+        'connect_timeout' => 30,
+        'timeout' => 60,
     ];
 }
 
+/**
+ * Zones of the .IN registry. Informational only: the registry decides which
+ * names can be registered, and WHMCS only routes TLDs assigned to this module.
+ */
 function ok_epp_gTld()
 {
-    //ccTLD
     $in_supported_tld_list = '
 .in
 .us.in
@@ -73,7 +76,7 @@ function ok_epp_gTld()
 .co.in
 .er.in
 ';
-    return ["ccTLD" => ok_epp_line2arr($in_supported_tld_list)];
+    return ['ccTLD' => ok_epp_line2arr($in_supported_tld_list)];
 }
 
 function ok_epp_domainStatus($isStatus = null)
@@ -95,48 +98,101 @@ function ok_epp_domainStatus($isStatus = null)
         'serverHold',
         'serverRenewProhibited',
         'serverTransferProhibited',
-        'serverUpdateProhibited'
+        'serverUpdateProhibited',
     ];
 
-    return $isStatus === null ? $domainStatus : in_array($isStatus, $domainStatus);
+    return $isStatus === null ? $domainStatus : in_array($isStatus, $domainStatus, true);
 }
 
 function ok_epp_contactsType($isType = null)
 {
-    $contactsType = [
-        'registrant',
-        'tech',
-        'admin',
-        'billing'
-    ];
+    $contactsType = ['registrant', 'tech', 'admin', 'billing'];
 
-    return $isType === null ? $contactsType : in_array($isType, $contactsType);
+    return $isType === null ? $contactsType : in_array($isType, $contactsType, true);
 }
 
 function ok_epp_trstatus($isStatus = null)
 {
-    $trstatus = [
-        'clientApproved',
-        'clientCancelled',
-        'clientRejected',
-        'pending',
-        'serverApproved',
-        'serverCancelled'
-    ];
-    return $isStatus === null ? $trstatus : in_array($isStatus, $trstatus);
+    $trstatus = ['clientApproved', 'clientCancelled', 'clientRejected', 'pending', 'serverApproved', 'serverCancelled'];
+
+    return $isStatus === null ? $trstatus : in_array($isStatus, $trstatus, true);
 }
 
-//for WHMCS Module
-function ok_epp_modulelog($send, $responsedata, $action)
+/**
+ * Masks secrets in an EPP document before it is logged: the login <clID>,
+ * every <pw>/<newPW> element whatever its namespace prefix (domain:pw,
+ * contact:pw, loginSec:pw, ...). Returns [maskedXml, foundSecrets].
+ */
+function ok_epp_maskXml($xml)
 {
-    $from = $to = [];
-    $from[] = "/<clID>[^<]*<\/clID>/i";
-    $to[] = '<clID>Not disclosed clID</clID>';
-    $from[] = "/<pw>[^<]*<\/pw>/i";
-    $to[] = '<pw>Not disclosed pw</pw>';
-    $sendforlog = preg_replace($from, $to, $send);
+    $xml = (string) $xml;
+    $secrets = [];
 
-    if (function_exists("logModuleCall")) {
-        logModuleCall(OKEPP_MODULE, $action, $sendforlog, $responsedata);
+    $xml = preg_replace_callback(
+        '#<((?:[A-Za-z_][\w.\-]*:)?(?:pw|newPW))(\s[^>]*)?>(.*?)</\1\s*>#s',
+        function ($m) use (&$secrets) {
+            if ($m[3] !== '' && $m[3] !== '[LOGIN-SECURITY]') {
+                $secrets[] = $m[3];
+            }
+            return '<' . $m[1] . $m[2] . '>' . ($m[3] === '[LOGIN-SECURITY]' ? $m[3] : '***') . '</' . $m[1] . '>';
+        },
+        $xml
+    );
+
+    // Only the <clID> of the <login> command (unprefixed or epp:) is the registrar login.
+    if (preg_match('#<(?:epp:)?login[\s>/]#', $xml)) {
+        $xml = preg_replace_callback(
+            '#<((?:epp:)?clID)>(.*?)</\1>#s',
+            function ($m) {
+                // Not added to the secret list: the registrar ID also appears,
+                // legitimately, as domain:clID etc. in responses.
+                return '<' . $m[1] . '>***</' . $m[1] . '>';
+            },
+            $xml
+        );
     }
+
+    return [$xml, $secrets];
+}
+
+/**
+ * The only log of this module: WHMCS module log (Utilities > Logs > Module Log).
+ */
+function ok_epp_modulelog($send, $responsedata, $action, array $secrets = [])
+{
+    if (!function_exists('logModuleCall')) {
+        return;
+    }
+
+    $send = is_scalar($send) ? (string) $send : json_encode($send);
+    $responsedata = is_scalar($responsedata) ? (string) $responsedata : json_encode($responsedata);
+
+    list($sendMasked, $s1) = ok_epp_maskXml($send);
+    list($respMasked, $s2) = ok_epp_maskXml($responsedata);
+
+    $replace = [];
+    foreach (array_merge($secrets, $s1, $s2) as $secret) {
+        $secret = (string) $secret;
+        if (strlen($secret) < 4) {
+            continue;
+        }
+        $replace[] = $secret;
+        $decoded = ok_epp_decodeWhmcs($secret);
+        if ($decoded !== $secret && strlen($decoded) >= 4) {
+            $replace[] = $decoded;
+        }
+        $encoded = ok_epp_xmlEscape($secret);
+        if ($encoded !== $secret && $encoded !== '') {
+            $replace[] = $encoded;
+        }
+    }
+    $replace = array_values(array_unique($replace));
+
+    // Belt and braces: also strip any literal occurrence of a known secret.
+    if ($replace) {
+        $sendMasked = str_replace($replace, '***', $sendMasked);
+        $respMasked = str_replace($replace, '***', $respMasked);
+    }
+
+    logModuleCall(MODULE, $action, $sendMasked, $respMasked, $respMasked, $replace);
 }
