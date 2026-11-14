@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.png binary
+*.gif binary
+
+# Not part of a downloaded source archive
+/.github        export-ignore
+/tests          export-ignore
+/.gitattributes export-ignore
+/.gitignore     export-ignore
+/CONTRIBUTING.md export-ignore

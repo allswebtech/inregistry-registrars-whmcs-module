@@ -1,11 +1,155 @@
 <?php
 
+namespace AllsWeb\InRegistry;
+
+/**
+ * An EPP error result (code >= 2000) or a transport/protocol failure.
+ * getCode() is the EPP result code, or 0 when the registry sent none.
+ */
+class EppException extends \Exception
+{
+}
+
+/**
+ * A parsed EPP document. Queries use fixed prefixes bound to namespace URIs,
+ * so parsing does not depend on the prefixes (or default namespace) the
+ * server chose.
+ */
+class EppResponse
+{
+    const NAMESPACES = [
+        'epp' => 'urn:ietf:params:xml:ns:epp-1.0',
+        'domain' => 'urn:ietf:params:xml:ns:domain-1.0',
+        'contact' => 'urn:ietf:params:xml:ns:contact-1.0',
+        'host' => 'urn:ietf:params:xml:ns:host-1.0',
+        'rgp' => 'urn:ietf:params:xml:ns:rgp-1.0',
+        'secDNS' => 'urn:ietf:params:xml:ns:secDNS-1.1',
+        'loginSec' => 'urn:ietf:params:xml:ns:epp:loginSec-1.0',
+    ];
+
+    /** @var \DOMDocument */
+    public $doc;
+    /** @var \DOMXPath */
+    public $xpath;
+    public $code = 0;
+    public $msg = '';
+    public $lang = 'en';
+
+    /**
+     * @throws EppException when the document is empty or not well-formed EPP XML
+     */
+    public static function parse($xml)
+    {
+        $xml = (string) $xml;
+        if (trim($xml) === '') {
+            throw new EppException('Empty response from the registry');
+        }
+
+        $doc = new \DOMDocument();
+        $previous = libxml_use_internal_errors(true);
+        $loaded = $doc->loadXML($xml, LIBXML_NONET);
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+
+        if (!$loaded || !$doc->documentElement) {
+            throw new EppException('Unparsable response from the registry');
+        }
+        if ($doc->doctype !== null) {
+            throw new EppException('Registry response contains a DTD; refused');
+        }
+        if ($doc->documentElement->namespaceURI !== self::NAMESPACES['epp'] || $doc->documentElement->localName !== 'epp') {
+            throw new EppException('Registry response is not an EPP document');
+        }
+
+        $res = new self();
+        $res->doc = $doc;
+        $res->xpath = new \DOMXPath($doc);
+        foreach (self::NAMESPACES as $prefix => $uri) {
+            $res->xpath->registerNamespace($prefix, $uri);
+        }
+        return $res;
+    }
+
+    /** @return \DOMElement[] */
+    public function nodes($query, $context = null)
+    {
+        $list = $context === null ? $this->xpath->query($query) : $this->xpath->query($query, $context);
+        $out = [];
+        if ($list !== false) {
+            foreach ($list as $node) {
+                $out[] = $node;
+            }
+        }
+        return $out;
+    }
+
+    public function node($query, $context = null)
+    {
+        $nodes = $this->nodes($query, $context);
+        return $nodes ? $nodes[0] : null;
+    }
+
+    public function text($query, $context = null, $default = '')
+    {
+        $node = $this->node($query, $context);
+        return $node === null ? $default : trim($node->textContent);
+    }
+
+    public function texts($query, $context = null)
+    {
+        $out = [];
+        foreach ($this->nodes($query, $context) as $node) {
+            $value = trim($node->textContent);
+            if ($value !== '') {
+                $out[] = $value;
+            }
+        }
+        return $out;
+    }
+
+    public function attr($query, $attribute, $context = null, $default = '')
+    {
+        $node = $this->node($query, $context);
+        return ($node instanceof \DOMElement && $node->hasAttribute($attribute)) ? $node->getAttribute($attribute) : $default;
+    }
+
+    public function meta()
+    {
+        return ['code' => $this->code, 'msg' => $this->msg, 'lang' => $this->lang];
+    }
+}
+
+/**
+ * EPP client (RFC 5730-5734, RFC 3915, RFC 5910, RFC 8807) for the .IN registry.
+ */
 class EppClient
 {
-    private $config;
-    private $params;
-    private $socket = null;
-    private $isLogined = false;
+    const NS_EPP = 'urn:ietf:params:xml:ns:epp-1.0';
+    const NS_DOMAIN = 'urn:ietf:params:xml:ns:domain-1.0';
+    const NS_CONTACT = 'urn:ietf:params:xml:ns:contact-1.0';
+    const NS_HOST = 'urn:ietf:params:xml:ns:host-1.0';
+    const NS_SECDNS = 'urn:ietf:params:xml:ns:secDNS-1.1';
+    const NS_RGP = 'urn:ietf:params:xml:ns:rgp-1.0';
+    const NS_IDN = 'urn:ietf:params:xml:ns:idn-1.0';
+    const NS_LOGINSEC = 'urn:ietf:params:xml:ns:epp:loginSec-1.0';
+
+    /** Extensions this module can use; login declares those the server also offers. */
+    const KNOWN_EXTENSIONS = [
+        'urn:ietf:params:xml:ns:secDNS-1.1',
+        'urn:ietf:params:xml:ns:rgp-1.0',
+        'urn:ietf:params:xml:ns:idn-1.0',
+        'urn:ietf:params:xml:ns:epp:loginSec-1.0',
+    ];
+
+    const MAX_FRAME_BYTES = 16777216; // 16 MB sanity limit for one EPP frame
+
+    protected $config;
+    protected $params = [];
+    protected $socket = null;
+    protected $isLogined = false;
+    protected $greeting = ['parsed' => false, 'svID' => '', 'objURI' => [], 'extURI' => []];
+    protected $loginExtensions = [];
+    protected $secrets = [];
 
     public function __construct($config)
     {
@@ -13,109 +157,459 @@ class EppClient
         $this->connect();
     }
 
-    // function __destruct()
-    // {
-    // 	$this->logout();
-    // }
+    public function __destruct()
+    {
+        $this->disconnect();
+    }
 
-
-    public function getConfig($key)
+    public function getConfig($key, $default = null)
     {
         if (isset($this->config[$key])) {
             return $this->config[$key];
-        } else {
-            throw new exception("Configuration Undeclared Parameters: {$key} ");
         }
+        if (func_num_args() > 1) {
+            return $default;
+        }
+        throw new EppException("Configuration Undeclared Parameters: {$key}");
     }
 
     public function getParams($key)
     {
         if (isset($this->params[$key])) {
             return $this->params[$key];
-        } else {
-            throw new exception("Undeclared Parameters: {$key} ");
         }
+        throw new EppException("Undeclared Parameters: {$key}");
     }
 
     public function setParams($params)
     {
-        $this->params = $params;
+        $this->params = (array) $params;
     }
 
-    public function connect($timeout = 30)
+    /** Parsed server greeting: ['parsed' => bool, 'svID' => string, 'objURI' => [], 'extURI' => []]. */
+    public function getGreeting()
     {
-        $errmsg = "";
-        $errno = 0;
+        return $this->greeting;
+    }
 
-        $host = $this->getConfig('host');
-        $port = $this->getConfig('port');
-        $tls_version = $this->getConfig('tls_version');
-        $opts = [
-            'ssl' => [
-                'verify_peer' => false,
-                'verify_peer_name' => false,
-                'verify_host' => false,
-                'local_cert' => $this->getConfig('local_cert'),
-                'local_pk' => $this->getConfig('local_pk'),
-                'passphrase' => $this->getConfig('passphrase'),
-                'allow_self_signed' => true
-            ]
-        ];
+    /** Extension URIs declared at login (greeting ∩ KNOWN_EXTENSIONS). */
+    public function getLoginExtensions()
+    {
+        return $this->loginExtensions;
+    }
 
-        $target = "tlsv{$tls_version}://{$host}:{$port}";
+    public function isLoggedIn()
+    {
+        return $this->isLogined;
+    }
 
-        $context = stream_context_create($opts);
-        $this->socket = stream_socket_client($target, $errno, $errmsg, $timeout, STREAM_CLIENT_CONNECT, $context);
+    // ------------------------------------------------------------------
+    // Transport (RFC 5734)
+    // ------------------------------------------------------------------
 
-        if (!is_resource($this->socket)) {
-            throw new exception("Connecting to " . $target . ". <p>The error message was '" . $errmsg . "' (code " . $errno . ")");
-            fclose($this->socket);
-        }
-
-        $this->read("connect");
+    public function connect($timeout = null)
+    {
+        $timeout = $timeout === null ? (int) $this->getConfig('connect_timeout', 30) : (int) $timeout;
+        $this->socket = $this->openSocket($timeout);
+        $this->greeting = self::parseGreeting($this->readFrame());
         return true;
     }
 
+    /**
+     * Opens the TLS connection. Overridden in tests to use a scripted transport.
+     *
+     * @return resource
+     */
+    protected function openSocket($timeout)
+    {
+        $host = (string) $this->getConfig('host');
+        $port = (int) $this->getConfig('port', 700);
+
+        $crypto = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT')) {
+            $crypto |= STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT;
+        }
+
+        $ssl = [
+            'peer_name' => $host,
+            'SNI_enabled' => true,
+            'disable_compression' => true,
+            'crypto_method' => (int) $this->getConfig('crypto_method', $crypto),
+        ];
+
+        $cert = trim((string) $this->getConfig('local_cert', ''));
+        $key = trim((string) $this->getConfig('local_pk', ''));
+        $passphrase = (string) $this->getConfig('passphrase', '');
+        if ($cert !== '') {
+            $ssl['local_cert'] = $cert;
+        }
+        if ($key !== '') {
+            $ssl['local_pk'] = $key;
+        }
+        if ($passphrase !== '') {
+            $ssl['passphrase'] = $passphrase;
+        }
+
+        // The registry uses a private CA: verify only when its CA file is configured.
+        $cafile = trim((string) $this->getConfig('cafile', ''));
+        if ($cafile !== '' && is_readable($cafile)) {
+            $ssl['verify_peer'] = true;
+            $ssl['verify_peer_name'] = true;
+            $ssl['allow_self_signed'] = false;
+            $ssl['cafile'] = $cafile;
+        } else {
+            $ssl['verify_peer'] = false;
+            $ssl['verify_peer_name'] = false;
+            $ssl['allow_self_signed'] = true;
+        }
+
+        $target = "tls://{$host}:{$port}";
+        $context = stream_context_create(['ssl' => $ssl]);
+
+        $warnings = [];
+        set_error_handler(function ($errno, $errstr) use (&$warnings) {
+            $warnings[] = $errstr;
+            return true;
+        });
+        try {
+            $socket = stream_socket_client($target, $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $context);
+        } finally {
+            restore_error_handler();
+        }
+
+        if (!is_resource($socket)) {
+            $reasons = [];
+            foreach (array_merge([(string) $errstr], $warnings) as $reason) {
+                $reasons[] = $reason;
+            }
+            if (function_exists('openssl_error_string')) {
+                while (($sslError = openssl_error_string()) !== false) {
+                    $reasons[] = $sslError;
+                }
+            }
+            $clean = [];
+            foreach ($reasons as $reason) {
+                $reason = trim(preg_replace('/\s+/', ' ', strip_tags(html_entity_decode((string) $reason, ENT_QUOTES, 'UTF-8'))));
+                if ($reason !== '' && !in_array($reason, $clean, true)) {
+                    $clean[] = $reason;
+                }
+            }
+            throw new EppException(
+                "Could not connect to {$target}" . ($clean ? ': ' . implode('; ', $clean) : '') . " (error {$errno})"
+            );
+        }
+
+        stream_set_timeout($socket, (int) $this->getConfig('timeout', 60));
+        return $socket;
+    }
+
+    /** Reads at most $length bytes; returns a non-empty string or throws. */
+    protected function readChunk($length)
+    {
+        if (!is_resource($this->socket)) {
+            throw new EppException('Not connected to the registry');
+        }
+        $data = @fread($this->socket, $length);
+        if ($data === false || $data === '') {
+            $meta = @stream_get_meta_data($this->socket);
+            if (!empty($meta['timed_out'])) {
+                throw new EppException('Timed out waiting for the registry response');
+            }
+            throw new EppException('Connection closed by the registry');
+        }
+        return $data;
+    }
+
+    /** Writes part of $data; returns the number of bytes written (> 0) or throws. */
+    protected function writeChunk($data)
+    {
+        if (!is_resource($this->socket)) {
+            throw new EppException('Not connected to the registry');
+        }
+        $written = @fwrite($this->socket, $data);
+        if ($written === false || $written === 0) {
+            $meta = @stream_get_meta_data($this->socket);
+            if (!empty($meta['timed_out'])) {
+                throw new EppException('Timed out writing to the registry');
+            }
+            throw new EppException('Error writing to the registry connection');
+        }
+        return $written;
+    }
+
+    protected function readBytes($length)
+    {
+        $buffer = '';
+        while (strlen($buffer) < $length) {
+            $buffer .= $this->readChunk(min(65536, $length - strlen($buffer)));
+        }
+        return $buffer;
+    }
+
+    protected function writeAll($data)
+    {
+        $data = (string) $data;
+        while ($data !== '') {
+            $written = (int) $this->writeChunk($data);
+            if ($written <= 0) {
+                throw new EppException('Error writing to the registry connection');
+            }
+            $data = (string) substr($data, $written);
+        }
+    }
+
+    /** Reads one EPP data unit: 4-byte big-endian total length, then the XML. */
+    protected function readFrame()
+    {
+        $header = $this->readBytes(4);
+        $unpacked = unpack('N', $header);
+        $length = (int) $unpacked[1];
+        if ($length < 4 || $length > self::MAX_FRAME_BYTES) {
+            throw new EppException("Invalid EPP frame length {$length} from the registry");
+        }
+        return $length === 4 ? '' : $this->readBytes($length - 4);
+    }
+
+    protected function writeFrame($xml)
+    {
+        $this->writeAll(pack('N', strlen($xml) + 4) . $xml);
+    }
+
+    /** Closes the connection quietly; never throws. */
+    public function disconnect()
+    {
+        if (is_resource($this->socket)) {
+            @fclose($this->socket);
+        }
+        $this->socket = null;
+        return true;
+    }
+
+    /**
+     * Parses a <greeting>; on any problem returns 'parsed' => false (and then
+     * login declares no extensions).
+     */
+    public static function parseGreeting($xml)
+    {
+        $greeting = ['parsed' => false, 'svID' => '', 'objURI' => [], 'extURI' => []];
+        try {
+            $res = EppResponse::parse($xml);
+        } catch (\Exception $e) {
+            return $greeting;
+        }
+        $node = $res->node('/epp:epp/epp:greeting');
+        if ($node === null) {
+            return $greeting;
+        }
+        $greeting['parsed'] = true;
+        $greeting['svID'] = $res->text('epp:svID', $node);
+        $greeting['objURI'] = $res->texts('epp:svcMenu/epp:objURI', $node);
+        $greeting['extURI'] = $res->texts('epp:svcMenu/epp:svcExtension/epp:extURI', $node);
+        return $greeting;
+    }
+
+    /** greeting extURIs ∩ KNOWN_EXTENSIONS, in KNOWN_EXTENSIONS order. */
+    public function negotiableExtensions()
+    {
+        if (empty($this->greeting['parsed'])) {
+            return [];
+        }
+        return array_values(array_intersect(self::KNOWN_EXTENSIONS, $this->greeting['extURI']));
+    }
+
+    // ------------------------------------------------------------------
+    // Command plumbing
+    // ------------------------------------------------------------------
+
+    /** Unique, token-safe client transaction ID (3-64 chars). */
+    protected function newClTRID($action)
+    {
+        $prefix = substr(preg_replace('/[^A-Za-z0-9]/', '', (string) $this->getConfig('identityprefix', '')), 0, 8);
+        $action = substr(preg_replace('/[^A-Za-z0-9\-]/', '', (string) $action), 0, 30);
+        $id = ($prefix !== '' ? $prefix . '-' : '') . $action . '-' . gmdate('YmdHis') . '-' . bin2hex(random_bytes(4));
+        return substr($id, 0, 64);
+    }
+
+    /**
+     * Literal template substitution. $values are XML-escaped, $raw are
+     * pre-built XML fragments. Each tag listed in $optional is removed when
+     * it ended up empty (listed children before parents).
+     */
+    protected function render($action, $template, array $values = [], array $raw = [], array $optional = [])
+    {
+        $map = ['{{ clTRID }}' => $this->newClTRID($action)];
+        foreach ($values as $key => $value) {
+            $map['{{ ' . $key . ' }}'] = ok_epp_xmlEscape(trim((string) $value));
+        }
+        foreach ($raw as $key => $value) {
+            $map['{{ ' . $key . ' }}'] = (string) $value;
+        }
+        $xml = strtr($template, $map);
+        foreach ($optional as $tag) {
+            $quoted = preg_quote($tag, '#');
+            $xml = preg_replace('#<' . $quoted . '>\s*</' . $quoted . '>\s*#', '', $xml);
+        }
+        return $xml;
+    }
+
+    /** One <tag>escaped</tag> per non-empty value. */
+    protected function tags($tag, $values, $transform = null)
+    {
+        $xml = '';
+        foreach ((array) $values as $value) {
+            $value = trim((string) $value);
+            if ($transform !== null) {
+                $value = call_user_func($transform, $value);
+            }
+            if ($value !== '') {
+                $xml .= '<' . $tag . '>' . ok_epp_xmlEscape($value) . '</' . $tag . '>';
+            }
+        }
+        return $xml;
+    }
+
+    protected function requireExtension($uri)
+    {
+        if (!in_array($uri, $this->loginExtensions, true)) {
+            throw new EppException("The registry did not offer the EPP extension {$uri} for this session");
+        }
+    }
+
+    /**
+     * Sends one command and returns the parsed response.
+     *
+     * @throws EppException on transport errors, unparsable responses and EPP error results
+     */
+    protected function request($command, $action)
+    {
+        $xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>' . "\n"
+            . '<epp xmlns="' . self::NS_EPP . '">' . $command . '</epp>';
+
+        try {
+            $this->writeFrame($xml);
+            $raw = $this->readFrame();
+        } catch (\Exception $e) {
+            ok_epp_modulelog($xml, 'Transport error: ' . $e->getMessage(), $action, $this->secrets);
+            throw $e;
+        }
+        ok_epp_modulelog($xml, $raw, $action, $this->secrets);
+
+        $res = EppResponse::parse($raw);
+        $results = $res->nodes('/epp:epp/epp:response/epp:result');
+        if (!$results) {
+            throw new EppException('Registry response has no result');
+        }
+
+        $errors = [];
+        $errorCode = 0;
+        foreach ($results as $result) {
+            $code = (int) $result->getAttribute('code');
+            if ($code < 2000) {
+                continue;
+            }
+            if ($errorCode === 0) {
+                $errorCode = $code;
+            }
+            $details = $res->texts('epp:extValue/epp:reason', $result);
+            foreach ($res->nodes('epp:value | epp:extValue/epp:value', $result) as $value) {
+                $first = null;
+                foreach ($value->childNodes as $child) {
+                    if ($child instanceof \DOMElement) {
+                        $first = $child;
+                        break;
+                    }
+                }
+                if ($first !== null && in_array($first->localName, ['pw', 'newPW'], true)) {
+                    continue; // never echo secrets into an error message
+                }
+                $text = trim(preg_replace('/\s+/', ' ', $value->textContent));
+                if ($text !== '') {
+                    $details[] = $text;
+                }
+            }
+            $msg = trim(preg_replace('/\s+/', ' ', $res->text('epp:msg', $result)));
+            if ($msg === '') {
+                $msg = 'Registry error';
+            }
+            $details = array_values(array_unique(array_filter($details, 'strlen')));
+            $errors[] = $msg . ($details ? ': ' . implode('; ', $details) : '') . " (EPP {$code})";
+        }
+        if ($errors) {
+            throw new EppException(implode(' | ', $errors), $errorCode);
+        }
+
+        $first = $results[0];
+        $res->code = (int) $first->getAttribute('code');
+        $res->msg = $res->text('epp:msg', $first);
+        $res->lang = $res->attr('epp:msg', 'lang', $first, 'en');
+        return $res;
+    }
+
+    protected function assertDomain($domainName)
+    {
+        if (!is_string($domainName) || trim($domainName) === '') {
+            throw new EppException('Invalid Domain Type.');
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Session
+    // ------------------------------------------------------------------
+
     public function login($usr, $pwd, $newPwd = null)
     {
-        $from = $to = [];
-        $from[] = '/{{ clID }}/';
-        //$to[] = htmlspecialchars($usr);
-        $to[] = '<clID>' . htmlspecialchars($usr) . '</clID>';
+        $extensions = $this->negotiableExtensions();
+        $loginSec = in_array(self::NS_LOGINSEC, $extensions, true);
 
-        $from[] = '/{{ pw }}/';
-        $to[] = '<pw>' . ok_epp_htmlspecialchars($pwd) . '</pw>';
+        $pwd = (string) $pwd;
+        $pwLong = ok_epp_strlen($pwd) > 16;
+        $newLong = $newPwd !== null && ok_epp_strlen((string) $newPwd) > 16;
+        $this->secrets = array_values(array_filter([$pwd, (string) $newPwd], 'strlen'));
 
-        $from[] = '/{{ newPW }}/';
-        $to[] = $newPwd === null ? '' : '<newPW>' . ok_epp_htmlspecialchars($newPwd) . '</newPW>';
+        // RFC 8807: with loginSec offered, a password longer than 16 characters goes in
+        // the extension. Without it the classic <pw> is sent whatever the length
+        // (RFC 5730 allows 16) and the registry decides.
+        $pwXml = ($loginSec && $pwLong) ? '[LOGIN-SECURITY]' : ok_epp_xmlEscape($pwd);
+        $newPwXml = '';
+        if ($newPwd !== null) {
+            $newPwXml = '<newPW>' . (($loginSec && $newLong) ? '[LOGIN-SECURITY]' : ok_epp_xmlEscape($newPwd)) . '</newPW>';
+        }
 
+        $svcExtension = '';
+        if ($extensions) {
+            $svcExtension = '<svcExtension>' . $this->tags('extURI', $extensions) . '</svcExtension>';
+        }
 
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-login-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <login>
-            {{ clID }}
-            {{ pw }}
-            {{ newPW }}
-            <options>
-                <version>1.0</version>
-                <lang>en</lang>
-            </options>
-            <svcs>
-                <objURI>urn:ietf:params:xml:ns:domain-1.0</objURI>
-                <objURI>urn:ietf:params:xml:ns:contact-1.0</objURI>
-                <objURI>urn:ietf:params:xml:ns:host-1.0</objURI>
-                <svcExtension>
-                    <extURI>urn:ietf:params:xml:ns:idn-1.0</extURI>
-                    <extURI>urn:ietf:params:xml:ns:secDNS-1.1</extURI>
-                </svcExtension>
-            </svcs>
-        </login>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-        $r = $this->_write($xml, __FUNCTION__);
+        $extension = '';
+        if ($loginSec && ($pwLong || $newLong)) {
+            $extension = '<extension><loginSec:loginSec xmlns:loginSec="' . self::NS_LOGINSEC . '">'
+                . '<loginSec:userAgent>'
+                . '<loginSec:app>' . ok_epp_xmlEscape('AllsWeb inregistry-whmcs-module ' . VERSION) . '</loginSec:app>'
+                . '<loginSec:tech>' . ok_epp_xmlEscape('PHP ' . PHP_VERSION) . '</loginSec:tech>'
+                . '</loginSec:userAgent>'
+                . ($pwLong ? '<loginSec:pw>' . ok_epp_xmlEscape($pwd) . '</loginSec:pw>' : '')
+                . ($newLong ? '<loginSec:newPW>' . ok_epp_xmlEscape($newPwd) . '</loginSec:newPW>' : '')
+                . '</loginSec:loginSec></extension>';
+        }
+
+        $xml = $this->render('login', '<command><login>'
+            . '<clID>{{ clID }}</clID><pw>{{ pw }}</pw>{{ newPW }}'
+            . '<options><version>1.0</version><lang>en</lang></options>'
+            . '<svcs>'
+            . '<objURI>' . self::NS_DOMAIN . '</objURI>'
+            . '<objURI>' . self::NS_CONTACT . '</objURI>'
+            . '<objURI>' . self::NS_HOST . '</objURI>'
+            . '{{ svcExtension }}'
+            . '</svcs></login>{{ extension }}<clTRID>{{ clTRID }}</clTRID></command>', ['clID' => $usr], [
+            'pw' => $pwXml,
+            'newPW' => $newPwXml,
+            'svcExtension' => $svcExtension,
+            'extension' => $extension,
+        ]);
+
+        $this->request($xml, 'login');
         $this->isLogined = true;
+        $this->loginExtensions = $extensions;
         return true;
     }
 
@@ -124,2134 +618,964 @@ class EppClient
         return $this->login($usr, $pwd, $newPwd);
     }
 
+    /** Ends the session and always closes the socket; never throws. */
     public function logout()
     {
-        if (!$this->isLogined) {
-            return true;
+        try {
+            if ($this->isLogined) {
+                $this->request($this->render('logout', '<command><logout/><clTRID>{{ clTRID }}</clTRID></command>'), 'logout');
+            }
+        } catch (\Exception $e) {
+            // Already logged by request(); the operation before logout stands.
+        } catch (\Throwable $e) {
+            // Same for PHP errors raised while logging out.
+        } finally {
+            $this->isLogined = false;
+            $this->disconnect();
         }
-
-        $from = $to = [];
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-logout-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <logout />
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-        $r = $this->_write($xml, __FUNCTION__);
-        $this->disconnect();
-        $this->isLogined = false;
         return true;
     }
 
-    public function read($action)
-    {
-        //ok_epp_log($action . '-this', $this);
+    // ------------------------------------------------------------------
+    // Domain (RFC 5731, RFC 3915, RFC 5910)
+    // ------------------------------------------------------------------
 
-        $hdr = stream_get_contents($this->socket, 4);
-        if ($hdr === false) {
-            throw new exception('Connection appears to have closed.');
-        }
-        if (strlen($hdr) < 4) {
-            throw new exception('Failed to read header from the connection.');
-        }
-
-        $unpacked = unpack('N', $hdr);
-        $xml = fread($this->socket, ($unpacked[1] - 4));
-        $xml = preg_replace('/></', ">\n<", $xml);
-
-        ok_epp_log($action . '-response', $xml);
-
-        return $xml;
-    }
-
-    public function disconnect()
-    {
-        $result = fclose($this->socket);
-        if (!$result) {
-            throw new exception('Error closing the connection.');
-        }
-        $this->socket = null;
-        return $result;
-    }
-
-    public function _write($xml, $action = 'Unknown', $fullXml = false)
-    {
-        //ok_epp_log($action . '-send-this', $this);
-        if ($fullXml === false) {
-            $xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-            <epp xmlns="urn:ietf:params:xml:ns:epp-1.0"
-            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-            xsi:schemaLocation="urn:ietf:params:xml:ns:epp-1.0 epp-1.0.xsd">' . $xml . '</epp>';
-        }
-
-
-        ok_epp_log($action . '-command', $xml);
-
-        if (fwrite($this->socket, pack('N', (strlen($xml) + 4)) . $xml) === false) {
-            throw new exception('Error writing to the connection.');
-        }
-        $response = $this->read($action);
-        if (function_exists(("ok_epp_modulelog"))) {
-            ok_epp_modulelog($xml, $response, $action);
-        }
-
-        $r = ok_epp_xml2array($response);
-        if (isset($r['epp']['response']['result_attr']) && ($r['epp']['response']['result_attr']['code'] >= 2000)) {
-            throw new exception($r['epp']['response']['result']['msg'] . ': ' . $r['epp']['response']['result']['extValue']['reason']);
-        }
-        return isset($r['epp']['response']) ? $r['epp']['response'] : $r;
-    }
-
-    //Domain Operations -> all commands as described in RFC 5731 and RFC 3915
-    //Extended domain availability check
     public function domainCheck($domainNames)
     {
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = ok_epp_simple_ArrStrTag($domainNames, "name");
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-check-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <check>
-            <check xmlns="urn:ietf:params:xml:ns:domain-1.0">
-                {{ name }}
-            </check>
-        </check>
-        <extension>
-            <check xmlns="urn:ar:params:xml:ns:exAvail-1.0" />
-        </extension>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
+        $names = $this->tags('domain:name', $domainNames);
+        if ($names === '') {
+            throw new EppException('No domain name to check');
+        }
+        $xml = $this->render('domain-check', '<command><check>'
+            . '<domain:check xmlns:domain="' . self::NS_DOMAIN . '">{{ names }}</domain:check>'
+            . '</check><clTRID>{{ clTRID }}</clTRID></command>', [], ['names' => $names]);
 
-        $r = $this->_write($xml, __FUNCTION__);
+        $r = $this->request($xml, __FUNCTION__);
         $result = [];
-        foreach (ok_epp_arr2arr($r['extension']['chkData']['cd']) as $dList) {
+        foreach ($r->nodes('//domain:chkData/domain:cd') as $cd) {
+            $avail = ok_epp_bool($r->attr('domain:name', 'avail', $cd, '0'));
             $result[] = [
-                "name" => $dList['name'],
-                "status" => $dList['state_attr']['s'],
-                "reason" => isset($dList['state']['reason']) ? $dList['state']['reason'] : "",
+                'name' => $r->text('domain:name', $cd),
+                'avail' => $avail,
+                'status' => $avail ? 'available' : 'unavailable',
+                'reason' => $r->text('domain:reason', $cd),
             ];
         }
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+        return array_merge($r->meta(), ['domain' => $result]);
     }
 
-    //Domain price check
-    public function domainPriceCheck($domainNames)
+    protected function contactsXml($contacts)
     {
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = ok_epp_simple_ArrStrTag($domainNames, "name");
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-price-check-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-    <check>
-        <check xmlns="urn:ietf:params:xml:ns:domain-1.0">
-            {{ name }}
-        </check>
-    </check>
-    <extension>
-        <check xmlns="urn:ar:params:xml:ns:price-1.2">
-            <period unit="y">1</period>
-        </check>
-    </extension>
-    <clTRID>{{ clTRID }}</clTRID>
-</command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $result = [];
-        foreach (ok_epp_arr2arr($r['extension']['chkData']['cd']) as $dList) {
-            if (isset($dList['reason'])) {
-                $result[] = [
-                    "name" => $dList['name'],
-                    "reason" => $dList['reason']
-                ];
+        $registrant = '';
+        $others = '';
+        foreach ((array) $contacts as $type => $id) {
+            if (!ok_epp_contactsType($type)) {
+                throw new EppException("Invalid contact type: {$type}");
+            }
+            if (trim((string) $id) === '') {
+                continue;
+            }
+            if ($type === 'registrant') {
+                $registrant = '<domain:registrant>' . ok_epp_xmlEscape(trim($id)) . '</domain:registrant>';
             } else {
-                $result[] = [
-                    "name" => $dList['name'],
-                    "category" => $dList['category'],
-                    "period" => $dList['period'],
-                    "period_unit" => $dList['period_attr']['unit'],
-                    "createPrice" => $dList['createPrice'],
-                    "renewPrice" => $dList['renewPrice'],
-                    "restorePrice" => $dList['restorePrice'],
-                    "transferPrice" => $dList['transferPrice'],
-                ];
+                $others .= '<domain:contact type="' . $type . '">' . ok_epp_xmlEscape(trim($id)) . '</domain:contact>';
             }
         }
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+        return $registrant . $others;
     }
 
-    //Domain Claims Check
-    public function domainClaimsCheck($domainNames)
+    protected function period($periodYr)
     {
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = ok_epp_simple_ArrStrTag($domainNames, "name");
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-claims-check-' . $clTRID);
-
-        $xml = preg_replace($from, $to, '<command>
-        <check>
-            <check xmlns="urn:ietf:params:xml:ns:domain-1.0">
-                {{ name }}
-            </check>
-        </check>
-        <extension>
-            <check xmlns="urn:ar:params:xml:ns:tmch-1.0" />
-        </extension>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $result = [];
-        foreach (ok_epp_arr2arr($r['extension']['chkData']['cd']) as $dList) {
-            $result[] = [
-                "name" => $dList['name'],
-                "claim" => $dList['name_attr']['claim'],
-                "key" => isset($dList['key']) ? $dList['key'] : ""
-            ];
+        if ($periodYr === null || $periodYr === '' || !is_numeric($periodYr)) {
+            return 1;
         }
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+        $period = (int) $periodYr;
+        if ($period < 1 || $period > 99 || (string) $period !== trim((string) $periodYr)) {
+            throw new EppException("Invalid period: {$periodYr}");
+        }
+        return $period;
     }
 
-    ////domain, price, claims check
-    public function domainCheck_Enhanced($domainNames, $priceCheck = false, $claimsCheck = false)
+    protected function buildDomainCreate($domainName, $periodYr, $contacts, $ns, $authInfo, $extension)
     {
-        $priceEx = '';
-        if ($priceCheck !== false) {
-            $period = is_numeric($priceCheck) ? $priceCheck : 1;
-            $priceEx = '<check xmlns="urn:ar:params:xml:ns:price-1.2"><period unit="y">' . $period . '</period></check>';
-        }
+        $this->assertDomain($domainName);
+        $authInfo = $authInfo === null ? ok_epp_generateObjectPW() : $authInfo;
 
-        $claimsEx = '';
-        if ($claimsCheck !== false) {
-            $claimsEx = '<check xmlns="urn:ar:params:xml:ns:tmch-1.0" />';
-        }
+        return $this->render('domain-create', '<command><create>'
+            . '<domain:create xmlns:domain="' . self::NS_DOMAIN . '">'
+            . '<domain:name>{{ name }}</domain:name>'
+            . '<domain:period unit="y">{{ period }}</domain:period>'
+            . '<domain:ns>{{ hostObjs }}</domain:ns>'
+            . '{{ contacts }}'
+            . '<domain:authInfo><domain:pw>{{ authInfoPw }}</domain:pw></domain:authInfo>'
+            . '</domain:create></create>{{ extension }}<clTRID>{{ clTRID }}</clTRID></command>', [
+            'name' => $domainName,
+            'period' => $this->period($periodYr),
+            'authInfoPw' => $authInfo,
+        ], [
+            'hostObjs' => $this->tags('domain:hostObj', $ns),
+            'contacts' => $this->contactsXml($contacts),
+            'extension' => $extension,
+        ], ['domain:ns']);
+    }
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = ok_epp_simple_ArrStrTag($domainNames, "name");
-
-        $from[] = '/{{ priceEx }}/';
-        $to[] = $priceEx;
-
-        $from[] = '/{{ claimsEx }}/';
-        $to[] = $claimsEx;
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-price-claims-check-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <check>
-            <check xmlns="urn:ietf:params:xml:ns:domain-1.0">
-                {{ name }}
-            </check>
-        </check>
-        <extension>
-            <check xmlns="urn:ar:params:xml:ns:exAvail-1.0" />
-            {{ priceEx }}
-            {{ claimsEx }}
-        </extension>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $result = [];
-        foreach ($r['extension']['chkData'] as $dLists) {
-            if (isset($dLists['cd'])) {
-                foreach (ok_epp_arr2arr($dLists['cd']) as $dList) {
-                    if (isset($dList['state_attr']['s'])) {
-                        $result[$dList['name']]['check'] = [
-                            "name" => $dList['name'],
-                            "status" => $dList['state_attr']['s'],
-                            "reason" => isset($dList['state']['reason']) ? $dList['state']['reason'] : "",
-                        ];
-                    }
-
-                    if (isset($dList['createPrice'])) {
-                        if (isset($dList['reason'])) {
-                            $result[$dList['name']]['price'] = [
-                                "name" => $dList['name'],
-                                "reason" => $dList['reason']
-                            ];
-                        } else {
-                            $result[$dList['name']]['price'] = [
-                                "name" => $dList['name'],
-                                "category" => $dList['category'],
-                                "period" => $dList['period'],
-                                "period_unit" => $dList['period_attr']['unit'],
-                                "createPrice" => $dList['createPrice'],
-                                "renewPrice" => $dList['renewPrice'],
-                                "restorePrice" => $dList['restorePrice'],
-                                "transferPrice" => $dList['transferPrice'],
-                            ];
-                        }
-                    }
-
-                    if (isset($dList['name_attr']['claim'])) {
-                        $result[$dList['name']]['claim'] = [
-                            "name" => $dList['name'],
-                            "claim" => $dList['name_attr']['claim'],
-                            "key" => isset($dList['key']) ? $dList['key'] : ""
-                        ];
-                    }
-                }
-            }
-        }
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+    protected function parseCreate(EppResponse $r)
+    {
+        $cre = $r->node('//domain:creData');
+        return array_merge($r->meta(), ['domain' => [
+            'success' => true,
+            'name' => $r->text('domain:name', $cre),
+            'crDate' => $r->text('domain:crDate', $cre),
+            'exDate' => $r->text('domain:exDate', $cre),
+        ]]);
     }
 
     public function domainCreate($domainName, $periodYr, $contacts, $ns, $authInfo = null)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
-        }
-        $authInfo = $authInfo === null ? ok_epp_generateObjectPW() : $authInfo;
-
-        $contactsXml = "";
-        if (!empty($contacts)) {
-            foreach ($contacts as $contactType => $contactID) {
-                if ($contactType == 'registrant') {
-                    $contactsXml .= '<domain:registrant>' . $contactID . '</domain:registrant>';
-                } else {
-                    $contactsXml .= '<domain:contact type="' . $contactType . '">' . $contactID . '</domain:contact>' . "\n";
-                }
-            }
-        }
-
-        $from = $to = [];
-
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ period }}/';
-        $to[] = is_numeric($periodYr) ? $periodYr : 1;
-
-        $from[] = '/{{ hostObjs }}/';
-        $to[] = ok_epp_simple_ArrStrTag($ns, "domain:hostObj");
-
-        $from[] = '/{{ contacts }}/';
-        $to[] = $contactsXml;
-
-        $from[] = '/{{ authInfoPw }}/';
-        $to[] = htmlspecialchars($authInfo);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-create-' . $clTRID);
-
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-    <create>
-      <domain:create
-       xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-        <domain:name>{{ name }}</domain:name>
-        <domain:period unit="y">{{ period }}</domain:period>
-        <domain:ns>
-          {{ hostObjs }}
-        </domain:ns>
-        {{ contacts }}
-        <domain:authInfo>
-          <domain:pw>{{ authInfoPw }}</domain:pw>
-        </domain:authInfo>
-      </domain:create>
-    </create>
-    <clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['domain:creData'];
-        $result = [
-            "success" => true,
-            "name" => $dList['domain:name'],
-            "crDate" => $dList['domain:crDate'],
-            "exDate" => $dList['domain:exDate'],
-        ];
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+        $xml = $this->buildDomainCreate($domainName, $periodYr, $contacts, $ns, $authInfo, '');
+        return $this->parseCreate($this->request($xml, __FUNCTION__));
     }
 
-    public function domainTransfer($domainName, $oprationType, $authInfo = "")
+    /**
+     * Domain create with DS records (RFC 5910 secDNS:create).
+     * $dsRecords: [['keyTag' => .., 'alg' => .., 'digestType' => .., 'digest' => ..], ...]
+     */
+    public function domainCreateDNSSEC($domainName, $periodYr, $contacts, $ns, array $dsRecords, $authInfo = null)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->requireExtension(self::NS_SECDNS);
+        if (!$dsRecords) {
+            throw new EppException('At least one DS record is required');
         }
-        if (!in_array($oprationType, ['request', 'query', 'cancel', 'reject', 'approve'])) {
-            throw new exception('Invalid value for transfer:op specified.');
+        $extension = '<extension><secDNS:create xmlns:secDNS="' . self::NS_SECDNS . '">'
+            . $this->dsDataXml($dsRecords) . '</secDNS:create></extension>';
+        $xml = $this->buildDomainCreate($domainName, $periodYr, $contacts, $ns, $authInfo, $extension);
+        return $this->parseCreate($this->request($xml, __FUNCTION__));
+    }
+
+    protected function dsDataXml(array $records)
+    {
+        $xml = '';
+        foreach ($records as $i => $ds) {
+            $keyTag = isset($ds['keyTag']) ? trim((string) $ds['keyTag']) : '';
+            $alg = isset($ds['alg']) ? trim((string) $ds['alg']) : '';
+            $digestType = isset($ds['digestType']) ? trim((string) $ds['digestType']) : '';
+            $digest = isset($ds['digest']) ? preg_replace('/\s+/', '', (string) $ds['digest']) : '';
+            if (!ctype_digit($keyTag) || (int) $keyTag > 65535
+                || !ctype_digit($alg) || (int) $alg > 255
+                || !ctype_digit($digestType) || (int) $digestType > 255
+                || $digest === '' || strlen($digest) % 2 !== 0 || !ctype_xdigit($digest)) {
+                throw new EppException('Invalid DS record #' . ($i + 1) . ': keyTag 0-65535, alg and digestType 0-255, digest hex');
+            }
+            $xml .= '<secDNS:dsData>'
+                . '<secDNS:keyTag>' . (int) $keyTag . '</secDNS:keyTag>'
+                . '<secDNS:alg>' . (int) $alg . '</secDNS:alg>'
+                . '<secDNS:digestType>' . (int) $digestType . '</secDNS:digestType>'
+                . '<secDNS:digest>' . strtoupper($digest) . '</secDNS:digest>'
+                . '</secDNS:dsData>';
         }
-        if ($oprationType == "request" && empty($authInfo)) {
-            throw new exception('Invalid value for authInfo.');
+        return $xml;
+    }
+
+    public function domainTransfer($domainName, $oprationType, $authInfo = '')
+    {
+        $this->assertDomain($domainName);
+        if (!in_array($oprationType, ['request', 'query', 'cancel', 'reject', 'approve'], true)) {
+            throw new EppException('Invalid value for transfer:op specified.');
+        }
+        if ($oprationType === 'request' && trim((string) $authInfo) === '') {
+            throw new EppException('Invalid value for authInfo.');
         }
 
-        $from = $to = [];
-
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ type }}/';
-        $to[] = htmlspecialchars($oprationType);
-
-        if ($oprationType === "request") {
-            $from[] = '/{{ periodYr }}/';
-            $periodYr = 1;
-            $to[] = '<domain:period unit="y">' . $periodYr . '</domain:period>';
-
-            $from[] = '/{{ authInfo }}/';
-            $to[] = !empty($authInfo) ? '<domain:authInfo><domain:pw>' . ok_epp_htmlspecialchars($authInfo) . '</domain:pw></domain:authInfo>' : "";
-        } else {
-            $from[] = '/{{ periodYr }}/';
-            $to[] = "";
-
-            $from[] = '/{{ authInfo }}/';
-            $to[] = "";
+        $extra = '';
+        if ($oprationType === 'request') {
+            // The registry transfers for one year.
+            $extra = '<domain:period unit="y">1</domain:period>'
+                . '<domain:authInfo><domain:pw>' . ok_epp_xmlEscape(trim($authInfo)) . '</domain:pw></domain:authInfo>';
         }
 
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-transfer-' . $oprationType . '-' . $clTRID);
+        $xml = $this->render('domain-transfer-' . $oprationType, '<command>'
+            . '<transfer op="' . $oprationType . '">'
+            . '<domain:transfer xmlns:domain="' . self::NS_DOMAIN . '">'
+            . '<domain:name>{{ name }}</domain:name>{{ extra }}'
+            . '</domain:transfer></transfer><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $domainName], ['extra' => $extra]);
 
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-				<transfer op="{{ type }}">
-				  <domain:transfer
-				   xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-					<domain:name>{{ name }}</domain:name>
-					{{ periodYr }}
-					{{ authInfo }}
-				  </domain:transfer>
-				</transfer>
-				<clTRID>{{ clTRID }}</clTRID>
-			  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['domain:trnData'];
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $dList['domain:name'],
-                "trStatus" => ($dList['domain:trStatus'] ?? ''),
-
-                "reID" => $dList['domain:reID'],
-                "reDate" => $dList['domain:reDate'],
-                "acID" => $dList['domain:acID'],
-                "acDate" => $dList['domain:acDate'],
-                "exDate" => $dList['domain:exDate'],
-            ]
-
-        ];
-
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        $trn = $r->node('//domain:trnData');
+        return array_merge($r->meta(), ['domain' => [
+            'success' => true,
+            'name' => $trn ? $r->text('domain:name', $trn) : $domainName,
+            'trStatus' => $trn ? $r->text('domain:trStatus', $trn) : '',
+            'reID' => $trn ? $r->text('domain:reID', $trn) : '',
+            'reDate' => $trn ? $r->text('domain:reDate', $trn) : '',
+            'acID' => $trn ? $r->text('domain:acID', $trn) : '',
+            'acDate' => $trn ? $r->text('domain:acDate', $trn) : '',
+            'exDate' => $trn ? $r->text('domain:exDate', $trn) : '',
+        ]]);
     }
 
     public function domainRenew($domainName, $periodYr = 1, $exDate = null)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        if ($exDate === null || $exDate === '') {
+            $info = $this->domainInfo($domainName);
+            $exDate = $info['domain']['exDate'];
+        }
+        if (!preg_match('/^(\d{4}-\d{2}-\d{2})/', trim((string) $exDate), $m)) {
+            throw new EppException("Invalid current expiry date: {$exDate}");
         }
 
-        if ($exDate === null) {
-            $dd =  $this->domainInfo($domainName);
-            $exDate = $dd['domain']['exDate'];
-        }
-        $expDate = preg_replace("/^(\d+\-\d+\-\d+)\D.*$/", "$1", $exDate);
+        $xml = $this->render('domain-renew', '<command><renew>'
+            . '<domain:renew xmlns:domain="' . self::NS_DOMAIN . '">'
+            . '<domain:name>{{ name }}</domain:name>'
+            . '<domain:curExpDate>{{ expDate }}</domain:curExpDate>'
+            . '<domain:period unit="y">{{ period }}</domain:period>'
+            . '</domain:renew></renew><clTRID>{{ clTRID }}</clTRID></command>', [
+            'name' => $domainName,
+            'expDate' => $m[1],
+            'period' => $this->period($periodYr),
+        ]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-        $from[] = '/{{ regperiod }}/';
-        $to[] = is_numeric($periodYr) ? $periodYr : 1;
-
-        $from[] = '/{{ expDate }}/';
-        $to[] = htmlspecialchars($expDate);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-renew-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-	<renew>
-	  <domain:renew
-	   xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-		<domain:name>{{ name }}</domain:name>
-		<domain:curExpDate>{{ expDate }}</domain:curExpDate>
-		<domain:period unit="y">{{ regperiod }}</domain:period>
-	  </domain:renew>
-	</renew>
-	<clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['domain:renData'];
-        $result = [
-            "success" => true,
-            "name" => $dList['domain:name'],
-            "exDate" => $dList['domain:exDate'],
-        ];
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        $ren = $r->node('//domain:renData');
+        return array_merge($r->meta(), ['domain' => [
+            'success' => true,
+            'name' => $ren ? $r->text('domain:name', $ren) : $domainName,
+            'exDate' => $ren ? $r->text('domain:exDate', $ren) : '',
+        ]]);
     }
 
     public function domainDelete($domainName)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
-        }
+        $this->assertDomain($domainName);
+        $xml = $this->render('domain-delete', '<command><delete>'
+            . '<domain:delete xmlns:domain="' . self::NS_DOMAIN . '"><domain:name>{{ name }}</domain:name></domain:delete>'
+            . '</delete><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $domainName]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-delete-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-	<delete>
-	  <domain:delete
-	   xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-		<domain:name>{{ name }}</domain:name>
-	  </domain:delete>
-	</delete>
-	<clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain Deleted"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain Deleted']]);
     }
 
+    /** RFC 3915 restore request. */
     public function domainRestore($domainName)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
-        }
+        $this->assertDomain($domainName);
+        $this->requireExtension(self::NS_RGP);
+        $xml = $this->render('domain-restore', '<command><update>'
+            . '<domain:update xmlns:domain="' . self::NS_DOMAIN . '"><domain:name>{{ name }}</domain:name><domain:chg/></domain:update>'
+            . '</update><extension>'
+            . '<rgp:update xmlns:rgp="' . self::NS_RGP . '"><rgp:restore op="request"/></rgp:update>'
+            . '</extension><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $domainName]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-restore-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-   <update>
-	 <domain:update xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-	   <domain:name>{{ name }}</domain:name>
-	   <domain:chg/>
-	 </domain:update>
-   </update>
-   <extension>
-	 <rgp:update xmlns:rgp="urn:ietf:params:xml:ns:rgp-1.0">
-	   <rgp:restore op="request"/>
-	 </rgp:update>
-   </extension>
-	<clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "rgpStatus" => isset($r['extension']['upData']['rgpStatus_attr']['s']) ? $r['extension']['upData']['rgpStatus_attr']['s'] : "",
-                "rgpDate" => isset($r['extension']['upData']['rgpStatus']) ? $r['extension']['upData']['rgpStatus'] : "",
-                "msg" => "Domain Restored"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => [
+            'success' => true,
+            'name' => $domainName,
+            'rgpStatus' => $r->attr('//rgp:upData/rgp:rgpStatus', 's'),
+            'rgpDate' => $r->text('//rgp:upData/rgp:rgpStatus'),
+            'msg' => 'Domain Restored',
+        ]]);
     }
 
-    public function domainRestoreReport($domainName)
+    /**
+     * RFC 3915 restore report. Every field is supplied by the caller:
+     * preData, postData, delTime, resTime (ISO 8601 date-time), resReason,
+     * statements (1 or 2 strings), other (optional).
+     */
+    public function domainRestoreReport($domainName, array $report)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        $this->requireExtension(self::NS_RGP);
+
+        foreach (['preData', 'postData', 'delTime', 'resTime', 'resReason'] as $key) {
+            if (!isset($report[$key]) || trim((string) $report[$key]) === '') {
+                throw new EppException("Missing restore report field: {$key}");
+            }
         }
+        foreach (['delTime', 'resTime'] as $key) {
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2})$/', trim($report[$key]))) {
+                throw new EppException("Invalid restore report {$key}: expected an ISO 8601 date-time");
+            }
+        }
+        $statements = array_values(array_filter(array_map('trim', (array) ($report['statements'] ?? [])), 'strlen'));
+        if (count($statements) < 1 || count($statements) > 2) {
+            throw new EppException('A restore report needs one or two statements');
+        }
+        $other = trim((string) ($report['other'] ?? ''));
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
+        $xml = $this->render('domain-restoreReport', '<command><update>'
+            . '<domain:update xmlns:domain="' . self::NS_DOMAIN . '"><domain:name>{{ name }}</domain:name><domain:chg/></domain:update>'
+            . '</update><extension>'
+            . '<rgp:update xmlns:rgp="' . self::NS_RGP . '"><rgp:restore op="report"><rgp:report>'
+            . '<rgp:preData>{{ preData }}</rgp:preData>'
+            . '<rgp:postData>{{ postData }}</rgp:postData>'
+            . '<rgp:delTime>{{ delTime }}</rgp:delTime>'
+            . '<rgp:resTime>{{ resTime }}</rgp:resTime>'
+            . '<rgp:resReason>{{ resReason }}</rgp:resReason>'
+            . '{{ statements }}'
+            . '<rgp:other>{{ other }}</rgp:other>'
+            . '</rgp:report></rgp:restore></rgp:update>'
+            . '</extension><clTRID>{{ clTRID }}</clTRID></command>', [
+            'name' => $domainName,
+            'preData' => $report['preData'],
+            'postData' => $report['postData'],
+            'delTime' => $report['delTime'],
+            'resTime' => $report['resTime'],
+            'resReason' => $report['resReason'],
+            'other' => $other,
+        ], ['statements' => $this->tags('rgp:statement', $statements)], ['rgp:other']);
 
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-restoreReport-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-	   <update>
-		 <domain:update
-		  xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-		  xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0
-		  domain-1.0.xsd">
-		   <domain:name>{{ name }}</domain:name>
-		   <domain:chg/>
-		 </domain:update>
-	   </update>
-	   <extension>
-		 <rgp:update xmlns:rgp="urn:ietf:params:xml:ns:rgp-1.0"
-		  xsi:schemaLocation="urn:ietf:params:xml:ns:rgp-1.0
-		  rgp-1.0.xsd">
-		   <rgp:restore op="report">
-			 <rgp:report>
-			   <rgp:preData>Pre-delete registration data goes here.
-			   Both XML and free text are allowed.</rgp:preData>
-			   <rgp:postData>Post-restore registration data goes here.
-			   Both XML and free text are allowed.</rgp:postData>
-			   <rgp:delTime>2019-10-10T22:00:00.0Z</rgp:delTime>
-			   <rgp:resTime>2019-10-20T22:00:00.0Z</rgp:resTime>
-			   <rgp:resReason>Registrant error.</rgp:resReason>
-			   <rgp:statement>This registrar has not restored the
-			   Registered Name in order to assume the rights to use
-			   or sell the Registered Name for itself or for any
-			   third party.</rgp:statement>
-			   <rgp:statement>The information in this report is
-			   true to best of this registrars knowledge, and this
-			   registrar acknowledges that intentionally supplying
-			   false information in this report shall constitute an
-			   incurable material breach of the
-			   Registry-Registrar Agreement.</rgp:statement>
-			   <rgp:other>Supporting information goes
-			   here.</rgp:other>
-			 </rgp:report>
-		   </rgp:restore>
-		 </rgp:update>
-	   </extension>
-	<clTRID>{{ clTRID }}</clTRID>
-	 </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain Restore Report"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain Restore Report']]);
     }
 
     public function domainInfo($domainName, $authInfo = null)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        $auth = '';
+        if ($authInfo !== null && trim((string) $authInfo) !== '') {
+            $auth = '<domain:authInfo><domain:pw>' . ok_epp_xmlEscape(trim($authInfo)) . '</domain:pw></domain:authInfo>';
+        }
+        $xml = $this->render('domain-info', '<command><info>'
+            . '<domain:info xmlns:domain="' . self::NS_DOMAIN . '">'
+            . '<domain:name hosts="all">{{ name }}</domain:name>{{ authInfo }}'
+            . '</domain:info></info><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $domainName], ['authInfo' => $auth]);
+
+        $r = $this->request($xml, __FUNCTION__);
+        $d = $r->node('//domain:infData');
+        if ($d === null) {
+            throw new EppException('Registry response has no domain information');
         }
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = $domainName;
-
-        $from[] = '/{{ authInfo }}/';
-        // $authInfo = ($authInfo === null ? '' : '<domain:authInfo><domain:pw><![CDATA['.htmlspecialchars($authInfo).']]></domain:pw></domain:authInfo>');
-        $authInfo = ($authInfo === null ? '' : '<authInfo><pw>' . ok_epp_htmlspecialchars($authInfo) . '</pw></authInfo>');
-        $to[] = $authInfo;
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-info-' . $clTRID);
-
-        /*
-        $commandXML = '<command>
-        <info>
-            <domain:info
-                xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-                xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-                <domain:name hosts="all">{{ name }}</domain:name>
-                {{ authInfo }}
-                </domain:info>
-        </info>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>';
-    */
-
-        $commandXML = '<command>
-        <info>
-            <info xmlns="urn:ietf:params:xml:ns:domain-1.0">
-                <name>{{ name }}</name>
-                {{ authInfo }}
-            </info>
-        </info>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>';
-
-        $xml = preg_replace($from, $to, $commandXML);
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['domain:infData'];
-
-        if (empty($dList['domain:status'])) {
-            $dStatus = [$dList['domain:status_attr']['s']];
-        } else {
-            $dStatus = [];
-            foreach ($dList['domain:status'] as $dStatusc) {
-                if (isset($dStatusc['s'])) {
-                    $dStatus[] = $dStatusc['s'];
-                }
+        $status = [];
+        foreach ($r->nodes('domain:status', $d) as $node) {
+            if ($node->getAttribute('s') !== '') {
+                $status[] = $node->getAttribute('s');
             }
         }
 
-        $ns = [];
-        if (isset($dList['domain:ns']['domain:hostObj'])) {
-            $ns = $dList['domain:ns']['domain:hostObj'];
-            sort($ns);
+        $contact = [];
+        $contacts = [];
+        foreach ($r->nodes('domain:contact', $d) as $node) {
+            $type = $node->getAttribute('type');
+            $id = trim($node->textContent);
+            $contacts[] = ['type' => $type, 'id' => $id];
+            if ($type !== '' && !isset($contact[$type])) {
+                $contact[$type] = $id;
+            }
         }
 
-        $host = [];
-        if (isset($dList['domain:host'])) {
-            $host = is_string($dList['domain:host']) ? [$dList['domain:host']] : $dList['domain:host'];
-            sort($host);
+        $ns = array_merge(
+            $r->texts('domain:ns/domain:hostObj', $d),
+            $r->texts('domain:ns/domain:hostAttr/domain:hostName', $d)
+        );
+        sort($ns);
+        $host = $r->texts('domain:host', $d);
+        sort($host);
+
+        $rgpStatus = [];
+        foreach ($r->nodes('//epp:extension/rgp:infData/rgp:rgpStatus') as $node) {
+            if ($node->getAttribute('s') !== '') {
+                $rgpStatus[] = $node->getAttribute('s');
+            }
         }
 
-        $result = [
-            "name" => $dList['domain:name'],
-            "roid" => $dList['domain:roid'],
-            "status" => is_string($dStatus) ? [$dStatus] : $dStatus,
-            "registrant" => $dList['domain:registrant'],
-            "contact" => [
-                $dList['domain:contact']["0_attr"]["type"] => $dList['domain:contact']["0"],
-                $dList['domain:contact']["1_attr"]["type"] => $dList['domain:contact']["1"],
-                $dList['domain:contact']["2_attr"]["type"] => $dList['domain:contact']["2"]
-            ],
-            "ns" => $ns,
-            "host" => $host,
-            "clID" => $dList['domain:clID'],
-            "crID" => $dList['domain:crID'],
-            "upID" => isset($dList['domain:upID']) ? $dList['domain:upID'] : "",
-            "upDate" => isset($dList['domain:upDate']) ? $dList['domain:upDate'] : "",
-            "crDate" => $dList['domain:crDate'],
-            "exDate" => ($dList['domain:exDate'] ?? ''),
-            "trDate" => isset($dList['domain:trDate']) ? $dList['domain:trDate'] : "",
+        return array_merge($r->meta(), ['domain' => [
+            'name' => $r->text('domain:name', $d),
+            'roid' => $r->text('domain:roid', $d),
+            'status' => $status,
+            'registrant' => $r->text('domain:registrant', $d),
+            'contact' => $contact,
+            'contacts' => $contacts,
+            'ns' => $ns,
+            'host' => $host,
+            'clID' => $r->text('domain:clID', $d),
+            'crID' => $r->text('domain:crID', $d),
+            'upID' => $r->text('domain:upID', $d),
+            'upDate' => $r->text('domain:upDate', $d),
+            'crDate' => $r->text('domain:crDate', $d),
+            'exDate' => $r->text('domain:exDate', $d),
+            'trDate' => $r->text('domain:trDate', $d),
+            'authInfo' => $r->text('domain:authInfo/domain:pw', $d),
+            'rgpStatus' => $rgpStatus,
+        ]]);
+    }
 
-            "authInfo" => ($dList['domain:authInfo']['domain:pw'] ?? ''),
-        ];
+    protected function noChange($key, $name, $msg)
+    {
+        return ['code' => 1000, 'msg' => 'No change', 'lang' => 'en', $key => ['success' => true, 'name' => $name, 'msg' => $msg]];
+    }
 
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => $result
-
-        ];
-        return $return;
+    protected function domainUpdate($action, $domainName, $add, $rem, $chg)
+    {
+        return $this->render($action, '<command><update>'
+            . '<domain:update xmlns:domain="' . self::NS_DOMAIN . '">'
+            . '<domain:name>{{ name }}</domain:name>{{ add }}{{ rem }}{{ chg }}'
+            . '</domain:update></update><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $domainName], [
+            'add' => $add === '' ? '' : '<domain:add>' . $add . '</domain:add>',
+            'rem' => $rem === '' ? '' : '<domain:rem>' . $rem . '</domain:rem>',
+            'chg' => $chg === '' ? '' : '<domain:chg>' . $chg . '</domain:chg>',
+        ]);
     }
 
     public function domainUpdateNS($domainName, $addNS = null, $remNS = null)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        $add = $this->tags('domain:hostObj', $addNS);
+        $rem = $this->tags('domain:hostObj', $remNS);
+        if ($add === '' && $rem === '') {
+            return $this->noChange('domain', $domainName, 'Domain NS unchanged');
         }
-
-        $remNSXML = ok_epp_simple_ArrStrTag($remNS, "domain:hostObj");
-        $addNSXML = ok_epp_simple_ArrStrTag($addNS, "domain:hostObj");
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ addNS }}/';
-        $to[] = !empty($addNSXML) ? '<domain:add><domain:ns>' . $addNSXML . '</domain:ns></domain:add>' : "";
-
-        $from[] = '/{{ remNS }}/';
-        $to[] = !empty($remNSXML) ? '<domain:rem><domain:ns>' . $remNSXML . '</domain:ns></domain:rem>' : "";
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-updateNS-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <update>
-            <domain:update
-                xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-                xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-                <domain:name>{{ name }}</domain:name>
-                {{ addNS }}
-                {{ remNS }}
-                </domain:update>
-        </update>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain NS Updated"
-            ]
-
-        ];
-        return $return;
+        $xml = $this->domainUpdate(
+            'domain-updateNS',
+            $domainName,
+            $add === '' ? '' : '<domain:ns>' . $add . '</domain:ns>',
+            $rem === '' ? '' : '<domain:ns>' . $rem . '</domain:ns>',
+            ''
+        );
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain NS Updated']]);
     }
 
-    public function domainTransferUpdate($domainName, $newContactId)
+    /**
+     * After an incoming transfer: one new contact for every role, a new
+     * auth code, and clientTransferProhibited.
+     */
+    public function domainTransferUpdate($domainName, $newContactId, $authInfo = null)
     {
-        $chgXML = $addXML = $remXML = "";
-
+        $this->assertDomain($domainName);
         $dInfo = $this->domainInfo($domainName);
-        if (in_array('pendingTransfer', $dInfo['domain']['status'])) {
-            throw new exception('Invalid Request');
+        if (in_array('pendingTransfer', $dInfo['domain']['status'], true)) {
+            throw new EppException('Invalid Request: transfer still pending');
         }
+        $authInfo = $authInfo === null ? ok_epp_generateObjectPW() : $authInfo;
+        $newId = ok_epp_xmlEscape(trim((string) $newContactId));
 
-        // start tag
-        $chgXML .= '<domain:chg>' . "\n";
-        $addXML .= '<domain:add>' . "\n";
-        $remXML .= '<domain:rem>' . "\n";
-
-
-        // contact update
-        $chgXML .= '<domain:registrant>' . htmlspecialchars($newContactId) . '</domain:registrant>' . "\n";
-        foreach ($dInfo['domain']['contact'] as $contactType => $oldContactId) {
-            $addXML .= '<domain:contact type="' . htmlspecialchars($contactType) . '">' . htmlspecialchars($newContactId) . '</domain:contact>' . "\n";
-            $remXML .= '<domain:contact type="' . htmlspecialchars($contactType) . '">' . htmlspecialchars($oldContactId) . '</domain:contact>' . "\n";
+        $addTypes = [];
+        $rem = '';
+        foreach ($dInfo['domain']['contacts'] as $c) {
+            if (!in_array($c['type'], ['admin', 'tech', 'billing'], true) || $c['id'] === trim((string) $newContactId)) {
+                continue;
+            }
+            $addTypes[$c['type']] = true;
+            $rem .= '<domain:contact type="' . $c['type'] . '">' . ok_epp_xmlEscape($c['id']) . '</domain:contact>';
         }
-
-        if (in_array('ok', $dInfo['domain']['status'])) {
-            // Registrar trasfer Lock Update
-            $addXML .= '<domain:status s="clientTransferProhibited"></domain:status>' . "\n";
+        $add = '';
+        foreach (array_keys($addTypes) as $type) {
+            $add .= '<domain:contact type="' . $type . '">' . $newId . '</domain:contact>';
         }
+        if (!in_array('clientTransferProhibited', $dInfo['domain']['status'], true)) {
+            $add .= '<domain:status s="clientTransferProhibited"/>';
+        }
+        $chg = '<domain:registrant>' . $newId . '</domain:registrant>'
+            . '<domain:authInfo><domain:pw>' . ok_epp_xmlEscape($authInfo) . '</domain:pw></domain:authInfo>';
 
-        // Password (AuthInfo) Update
-        $chgXML .= '<domain:authInfo><domain:pw>' . htmlspecialchars(ok_epp_generateObjectPW()) . '</domain:pw></domain:authInfo>' . "\n";
-
-
-        // end tag
-        $chgXML .= '</domain:chg>' . "\n";
-        $addXML .= '</domain:add>' . "\n";
-        $remXML .= '</domain:rem>' . "\n";
-
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ add }}/';
-        $to[] = $addXML;
-        $from[] = '/{{ rem }}/';
-        $to[] = $remXML;
-        $from[] = '/{{ chg }}/';
-        $to[] = $chgXML;
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-domainTransferUpdate-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-   <update>
-     <domain:update
-		   xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-		   xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-       <domain:name>{{ name }}</domain:name>
-       {{ add }}
-       {{ rem }}
-       {{ chg }}
-     </domain:update>
-   </update>
-   <clTRID>{{ clTRID }}</clTRID>
- </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain Contact Updated"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($this->domainUpdate('domain-transferUpdate', $domainName, $add, $rem, $chg), __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => [
+            'success' => true,
+            'name' => $domainName,
+            'authInfo' => $authInfo,
+            'msg' => 'Domain Contact Updated',
+        ]]);
     }
 
     public function domainUpdateContact($domainName, $contactType, $newContactId = null, $oldContactId = null)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain type');
+        if (!is_string($domainName) || trim($domainName) === '') {
+            throw new EppException('Invalid Domain type');
         }
-
         if (!ok_epp_contactsType($contactType)) {
-            throw new exception('Invalid Contact type');
+            throw new EppException('Invalid Contact type');
         }
-        $chgXML = $addXML = $remXML = "";
+        $add = $rem = $chg = '';
         if ($contactType === 'registrant') {
-            $chgXML = '<domain:chg><domain:registrant>' . htmlspecialchars($newContactId) . '</domain:registrant></domain:chg>';
+            if (trim((string) $newContactId) === '') {
+                throw new EppException('A new registrant contact ID is required');
+            }
+            $chg = '<domain:registrant>' . ok_epp_xmlEscape(trim($newContactId)) . '</domain:registrant>';
         } else {
-            $addXML = $newContactId === null ? '' : '<domain:add><domain:contact type="' . htmlspecialchars($contactType) . '">' . htmlspecialchars($newContactId) . '</domain:contact></domain:add>';
-            $remXML = $oldContactId === null ? '' : '<domain:rem><domain:contact type="' . htmlspecialchars($contactType) . '">' . htmlspecialchars($oldContactId) . '</domain:contact></domain:rem>';
+            if (trim((string) $newContactId) !== '') {
+                $add = '<domain:contact type="' . $contactType . '">' . ok_epp_xmlEscape(trim($newContactId)) . '</domain:contact>';
+            }
+            if (trim((string) $oldContactId) !== '') {
+                $rem = '<domain:contact type="' . $contactType . '">' . ok_epp_xmlEscape(trim($oldContactId)) . '</domain:contact>';
+            }
         }
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ add }}/';
-        $to[] = $addXML;
-        $from[] = '/{{ rem }}/';
-        $to[] = $remXML;
-        $from[] = '/{{ chg }}/';
-        $to[] = $chgXML;
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-updateContact-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-   <update>
-     <domain:update
-		   xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-		   xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-       <domain:name>{{ name }}</domain:name>
-       {{ add }}
-       {{ rem }}
-       {{ chg }}
-     </domain:update>
-   </update>
-   <clTRID>{{ clTRID }}</clTRID>
- </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain Contact Updated"
-            ]
-
-        ];
-        return $return;
+        if ($add === '' && $rem === '' && $chg === '') {
+            return $this->noChange('domain', $domainName, 'Domain Contact unchanged');
+        }
+        $r = $this->request($this->domainUpdate('domain-updateContact', $domainName, $add, $rem, $chg), __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain Contact Updated']]);
     }
 
-    public function domainUpdateStatus($domainName, $status, $command = "add")
+    public function domainUpdateStatus($domainName, $status, $command = 'add')
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        $statusXml = '';
+        foreach (array_unique(array_filter(array_map('trim', (array) $status), 'strlen')) as $s) {
+            $statusXml .= '<domain:status s="' . ok_epp_xmlEscape($s) . '"/>';
         }
-
-        $addXML = '';
-        if (!empty($status)) {
-            $addXML .= ($command === 'add') ? '<domain:add>' : '<domain:rem>';
-            if (is_array($status)) {
-                foreach ($status as $sv) {
-                    $addXML .= '<domain:status s="' . htmlspecialchars($sv) . '"></domain:status>';
-                }
-            } else {
-                $addXML .= '<domain:status s="' . htmlspecialchars($status) . '"></domain:status>';
-            }
-            $addXML .= ($command === 'add') ? '</domain:add>' : '</domain:rem>';
+        if ($statusXml === '') {
+            return $this->noChange('domain', $domainName, 'Domain Status unchanged');
         }
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ addRem }}/';
-        $to[] = $addXML;
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-updateStatus-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <update>
-            <domain:update
-                xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-                xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-                <domain:name>{{ name }}</domain:name>
-                {{ addRem }}
-                </domain:update>
-        </update>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain Status Updated"
-            ]
-
-        ];
-        return $return;
+        $add = $command === 'add' ? $statusXml : '';
+        $rem = $command === 'add' ? '' : $statusXml;
+        $r = $this->request($this->domainUpdate('domain-updateStatus', $domainName, $add, $rem, ''), __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain Status Updated']]);
     }
 
     public function domainUpdateAuthinfo($domainName, $authInfo)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        if (trim((string) $authInfo) === '') {
+            throw new EppException('Empty auth code');
         }
-
-        $from = $to = [];
-
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ authInfo }}/';
-        $to[] = ok_epp_htmlspecialchars($authInfo);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-updateStatus-' . $clTRID);
-
-        $xml = preg_replace($from, $to, '<command>
-   <update>
-     <domain:update
-		   xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-		   xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-       <domain:name>{{ name }}</domain:name>
-       <domain:chg>
-         <domain:authInfo>
-           <domain:pw>{{ authInfo }}</domain:pw>
-         </domain:authInfo>
-       </domain:chg>
-     </domain:update>
-   </update>
-   <clTRID>{{ clTRID }}</clTRID>
- </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain AuthInfo Updated"
-            ]
-
-        ];
-        return $return;
+        $chg = '<domain:authInfo><domain:pw>' . ok_epp_xmlEscape(trim($authInfo)) . '</domain:pw></domain:authInfo>';
+        $r = $this->request($this->domainUpdate('domain-updateAuthinfo', $domainName, '', '', $chg), __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain AuthInfo Updated']]);
     }
 
-    //domainCreateDNSSEC pending
-    public function domainUpdateDNSSEC($domainName, $command = "add", $params = [])
+    /**
+     * RFC 5910 DS-data update. $addDs/$remDs: lists of
+     * ['keyTag' => .., 'alg' => .., 'digestType' => .., 'digest' => ..];
+     * $removeAll sends <secDNS:rem><secDNS:all>true</secDNS:all></secDNS:rem>.
+     */
+    public function domainUpdateDNSSEC($domainName, array $addDs = [], array $remDs = [], $removeAll = false)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
+        $this->assertDomain($domainName);
+        $this->requireExtension(self::NS_SECDNS);
+        if ($removeAll && $remDs) {
+            throw new EppException('Use either removeAll or a list of DS records to remove, not both');
+        }
+        $rem = '';
+        if ($removeAll) {
+            $rem = '<secDNS:rem><secDNS:all>true</secDNS:all></secDNS:rem>';
+        } elseif ($remDs) {
+            $rem = '<secDNS:rem>' . $this->dsDataXml($remDs) . '</secDNS:rem>';
+        }
+        $add = $addDs ? '<secDNS:add>' . $this->dsDataXml($addDs) . '</secDNS:add>' : '';
+        if ($rem === '' && $add === '') {
+            return $this->noChange('domain', $domainName, 'Domain DNSSEC unchanged');
         }
 
-        // $params = [
-        //     'keyTag_1' => '33409',
-        //     'alg_1' => '8',
-        //     'digestType_1' => '1',
-        //     'digest_1' => 'F4D6E26B3483C3D7B3EE17799B0570497FAF33BCB12B9B9CE573DDB491E16948'
-        // ];
+        $xml = $this->render('domain-updateDNSSEC', '<command><update>'
+            . '<domain:update xmlns:domain="' . self::NS_DOMAIN . '"><domain:name>{{ name }}</domain:name></domain:update>'
+            . '</update><extension>'
+            . '<secDNS:update xmlns:secDNS="' . self::NS_SECDNS . '">{{ rem }}{{ add }}</secDNS:update>'
+            . '</extension><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $domainName], ['rem' => $rem, 'add' => $add]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-        if ($command == 'add') {
-            $from[] = '/{{ add }}/';
-            $to[] = "<secDNS:add>
-				<secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_1']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_1']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_1']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_1']) . "</secDNS:digest>
-		  </secDNS:dsData>
-		  </secDNS:add>";
-            $from[] = '/{{ rem }}/';
-            $to[] = "";
-            $from[] = '/{{ addrem }}/';
-            $to[] = "";
-        } elseif ($command == 'rem') {
-            $from[] = '/{{ add }}/';
-            $to[] = "";
-            $from[] = '/{{ rem }}/';
-            $to[] = "<secDNS:rem>
-				<secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_1']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_1']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_1']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_1']) . "</secDNS:digest>
-		  </secDNS:dsData>
-		  </secDNS:rem>";
-            $from[] = '/{{ addrem }}/';
-            $to[] = "";
-        } elseif ($command == 'addrem') {
-            $from[] = '/{{ add }}/';
-            $to[] = "";
-            $from[] = '/{{ rem }}/';
-            $to[] = "";
-            $from[] = '/{{ addrem }}/';
-            $to[] = "<secDNS:rem>
-				<secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_1']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_1']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_1']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_1']) . "</secDNS:digest>
-		  </secDNS:dsData>
-		  </secDNS:rem>
-		  <secDNS:add>
-		  <secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_2']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_2']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_2']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_2']) . "</secDNS:digest>
-		  </secDNS:dsData>
-		  </secDNS:add>";
-        }
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-updateDNSSEC-' . $clTRID);
-
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-        <update>
-            <domain:update
-                xmlns:domain="urn:ietf:params:xml:ns:domain-1.0"
-                xsi:schemaLocation="urn:ietf:params:xml:ns:domain-1.0 domain-1.0.xsd">
-                <domain:name>{{ name }}</domain:name>
-            </domain:update>
-        </update>
-        <extension>
-            <secDNS:update
-                xmlns:secDNS="urn:ietf:params:xml:ns:secDNS-1.1"
-                xsi:schemaLocation="urn:ietf:params:xml:ns:secDNS-1.1 secDNS-1.1.xsd">
-                {{ add }}
-                {{ rem }}
-                {{ addrem }}
-            </secDNS:update>
-        </extension>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "domain" => [
-                "success" => true,
-                "name" => $domainName,
-                "msg" => "Domain DNSSEC Updated"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['domain' => ['success' => true, 'name' => $domainName, 'msg' => 'Domain DNSSEC Updated']]);
     }
 
+    // ------------------------------------------------------------------
+    // Contact (RFC 5733)
+    // ------------------------------------------------------------------
 
-    public function domainCreateClaims($domainName, $params)
-    {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
-        }
-
-        $nsXML = ok_epp_simple_ArrStrTag($params['ns'], "domain:hostObj");
-        $contactsXml = "";
-        if (!empty($params['contacts'])) {
-            foreach ($params['contacts'] as $contactType => $contactID) {
-                $contactsXml .= '<domain:contact type="' . $contactType . '">' . $contactID . '</domain:contact>' . "\n";
-            }
-        }
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-
-        $from[] = '/{{ period }}/';
-        $to[] = is_numeric($params['period']) ? $params['period'] : 1;
-
-        $from[] = '/{{ hostObjs }}/';
-        $to[] = $nsXML;
-
-        $from[] = '/{{ registrant }}/';
-        $to[] = htmlspecialchars($params['registrant']);
-
-        $from[] = '/{{ contacts }}/';
-        $to[] = $contactsXml;
-
-
-        $from[] = '/{{ authInfoPw }}/';
-        $to[] = htmlspecialchars($params['authInfoPw']);
-
-        $from[] = '/{{ noticeID }}/';
-        $to[] = htmlspecialchars($params['noticeID']);
-        $from[] = '/{{ notAfter }}/';
-        $to[] = htmlspecialchars($params['notAfter']);
-        $from[] = '/{{ acceptedDate }}/';
-        $to[] = htmlspecialchars($params['acceptedDate']);
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-createClaims-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-    <create>
-      <domain:create
-       xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-        <domain:name>{{ name }}</domain:name>
-        <domain:period unit="y">{{ period }}</domain:period>
-        <domain:ns>
-          {{ hostObjs }}
-        </domain:ns>
-        <domain:registrant>{{ registrant }}</domain:registrant>
-        {{ contacts }}
-        <domain:authInfo>
-          <domain:pw>{{ authInfoPw }}</domain:pw>
-        </domain:authInfo>
-      </domain:create>
-      <extension>
-         <launch:create xmlns:launch="urn:ietf:params:xml:ns:launch-1.0">
-            <launch:phase>claims</launch:phase>
-            <launch:notice>
-               <launch:noticeID>{{ noticeID }}</launch:noticeID>
-               <launch:notAfter>{{ notAfter }}</launch:notAfter>
-               <launch:acceptedDate>{{ acceptedDate }}</launch:acceptedDate>
-            </launch:notice>
-         </launch:create>
-      </extension>
-    </create>
-    <clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        return $r = $this->_write($xml, __FUNCTION__);
-    }
-
-    public function domainCreateDNSSEC($domainName, $params)
-    {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
-        }
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($domainName);
-        $from[] = '/{{ period }}/';
-        $to[] = (int)($params['period']);
-        if (isset($params['nss'])) {
-            $text = '';
-            foreach ($params['nss'] as $hostObj) {
-                $text .= '<domain:hostObj>' . $hostObj . '</domain:hostObj>' . "\n";
-            }
-            $from[] = '/{{ hostObjs }}/';
-            $to[] = $text;
-        } else {
-            $from[] = '/{{ hostObjs }}/';
-            $to[] = '';
-        }
-        $from[] = '/{{ registrant }}/';
-        $to[] = htmlspecialchars($params['registrant']);
-        $text = '';
-        foreach ($params['contacts'] as $contactType => $contactID) {
-            $text .= '<domain:contact type="' . $contactType . '">' . $contactID . '</domain:contact>' . "\n";
-        }
-        $from[] = '/{{ contacts }}/';
-        $to[] = $text;
-        $from[] = '/{{ authInfoPw }}/';
-        $to[] = htmlspecialchars($params['authInfoPw']);
-        if ($params['dnssec_records'] == 1) {
-            $from[] = '/{{ dnssec_data }}/';
-            $to[] = "<secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_1']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_1']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_1']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_1']) . "</secDNS:digest>
-		  </secDNS:dsData>";
-        } elseif ($params['dnssec_records'] == 2) {
-            $from[] = '/{{ dnssec_data }}/';
-            $to[] = "<secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_1']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_1']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_1']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_1']) . "</secDNS:digest>
-		  </secDNS:dsData>
-		  <secDNS:dsData>
-			<secDNS:keyTag>" . htmlspecialchars($params['keyTag_2']) . "</secDNS:keyTag>
-			<secDNS:alg>" . htmlspecialchars($params['alg_2']) . "</secDNS:alg>
-			<secDNS:digestType>" . htmlspecialchars($params['digestType_2']) . "</secDNS:digestType>
-			<secDNS:digest>" . htmlspecialchars($params['digest_2']) . "</secDNS:digest>
-		  </secDNS:dsData>";
-        }
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-domain-createDNSSEC-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-    <create>
-      <domain:create
-       xmlns:domain="urn:ietf:params:xml:ns:domain-1.0">
-        <domain:name>{{ name }}</domain:name>
-        <domain:period unit="y">{{ period }}</domain:period>
-        <domain:ns>
-          {{ hostObjs }}
-        </domain:ns>
-        <domain:registrant>{{ registrant }}</domain:registrant>
-        {{ contacts }}
-        <domain:authInfo>
-          <domain:pw>{{ authInfoPw }}</domain:pw>
-        </domain:authInfo>
-      </domain:create>
-	<extension>
-	  <secDNS:create xmlns:secDNS="urn:ietf:params:xml:ns:secDNS-1.1">
-		<secDNS:add>
-		  {{ dnssec_data }}
-		</secDNS:add>
-	  </secDNS:create>
-	</extension>
-    </create>
-    <clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        return $r = $this->_write($xml, __FUNCTION__);
-    }
-
-    //contact-chg
-    //contact-update
-
-    // $contacts -> MUST TRY strtoupper
     public function contactCheck($contactIdentifier)
     {
-        $from = $to = [];
-        $from[] = '/{{ id }}/';
-        $to[] = ok_epp_simple_ArrStrTag($contactIdentifier, "contact:id", "strtoupper");
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-contact-check-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <check>
-            <contact:check
-                xmlns:contact="urn:ietf:params:xml:ns:contact-1.0"
-                xsi:schemaLocation="urn:ietf:params:xml:ns:contact-1.0 contact-1.0.xsd">
-                {{ id }}
-            </contact:check>
-        </check>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
+        $ids = $this->tags('contact:id', $contactIdentifier, 'strtoupper');
+        if ($ids === '') {
+            throw new EppException('No contact ID to check');
+        }
+        $xml = $this->render('contact-check', '<command><check>'
+            . '<contact:check xmlns:contact="' . self::NS_CONTACT . '">{{ ids }}</contact:check>'
+            . '</check><clTRID>{{ clTRID }}</clTRID></command>', [], ['ids' => $ids]);
 
-        $r = $this->_write($xml, __FUNCTION__);
+        $r = $this->request($xml, __FUNCTION__);
         $result = [];
-        foreach (ok_epp_arr2arr($r['resData']['contact:chkData']['contact:cd']) as $dList) {
+        foreach ($r->nodes('//contact:chkData/contact:cd') as $cd) {
             $result[] = [
-                "id" => $dList['contact:id'],
-                "avail" => $dList['contact:id_attr']['avail'],
-                "reason" => isset($dList['contact:reason']) ? $dList['contact:reason'] : "",
+                'id' => $r->text('contact:id', $cd),
+                'avail' => ok_epp_bool($r->attr('contact:id', 'avail', $cd, '0')),
+                'reason' => $r->text('contact:reason', $cd),
             ];
         }
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "contact" => $result
-
-        ];
-        return $return;
+        return array_merge($r->meta(), ['contact' => $result]);
     }
 
     public function contactInfo($contactIdentifier)
     {
-        if (!is_string($contactIdentifier)) {
-            throw new exception('Invalid Contact Type.');
+        if (!is_string($contactIdentifier) || trim($contactIdentifier) === '') {
+            throw new EppException('Invalid Contact Type.');
+        }
+        $xml = $this->render('contact-info', '<command><info>'
+            . '<contact:info xmlns:contact="' . self::NS_CONTACT . '"><contact:id>{{ id }}</contact:id></contact:info>'
+            . '</info><clTRID>{{ clTRID }}</clTRID></command>', ['id' => $contactIdentifier]);
+
+        $r = $this->request($xml, __FUNCTION__);
+        $c = $r->node('//contact:infData');
+        if ($c === null) {
+            throw new EppException('Registry response has no contact information');
         }
 
-        $from = $to = [];
-        $from[] = '/{{ id }}/';
-        $to[] = htmlspecialchars($contactIdentifier);
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-contact-info-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <info>
-            <contact:info xmlns:contact="urn:ietf:params:xml:ns:contact-1.0">
-                <contact:id>{{ id }}</contact:id>
-            </contact:info>
-        </info>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
+        // Prefer the internationalized (ASCII) form, else the first block.
+        $postal = $r->node('contact:postalInfo[@type="int"]', $c);
+        if ($postal === null) {
+            $postal = $r->node('contact:postalInfo', $c);
+        }
+        $streets = $postal ? $r->texts('contact:addr/contact:street', $postal) : [];
 
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['contact:infData'];
-
-        if (empty($dList['contact:status'])) {
-            $dStatus = [$dList['contact:status_attr']['s']];
-        } else {
-            $dStatus = [];
-            foreach ($dList['contact:status'] as $dStatusc) {
-                if (isset($dStatusc['s'])) {
-                    $dStatus[] = $dStatusc['s'];
-                }
+        $status = [];
+        foreach ($r->nodes('contact:status', $c) as $node) {
+            if ($node->getAttribute('s') !== '') {
+                $status[] = $node->getAttribute('s');
             }
         }
 
-        $addr = $dList['contact:postalInfo']['contact:addr'];
-        $result = [
-            "id" => $dList['contact:id'],
-            "roid" => $dList['contact:roid'],
-            "status" => $dStatus,
-            "postalInfo" => [
-                "name" => $dList['contact:postalInfo']['contact:name'],
-                "org" => ($dList['contact:postalInfo']['contact:org'] ?? ''),
-                "addr" => [
-                    "street" => $addr['contact:street'],
-                    "city" => $addr['contact:city'],
-                    "state" => $addr['contact:sp'],
-                    "postal" => $addr['contact:pc'],
-                    "country" => $addr['contact:cc'],
-                ],
-                "type" => $dList['contact:postalInfo_attr']['type']
+        $addr = [
+            'street' => $streets,
+            'city' => $postal ? $r->text('contact:addr/contact:city', $postal) : '',
+            'state' => $postal ? $r->text('contact:addr/contact:sp', $postal) : '',
+            'postal' => $postal ? $r->text('contact:addr/contact:pc', $postal) : '',
+            'country' => $postal ? $r->text('contact:addr/contact:cc', $postal) : '',
+        ];
+        foreach (array_values($streets) as $i => $street) {
+            $addr['street' . ($i + 1)] = $street;
+        }
+
+        return array_merge($r->meta(), ['contact' => [
+            'id' => $r->text('contact:id', $c),
+            'roid' => $r->text('contact:roid', $c),
+            'status' => $status,
+            'postalInfo' => [
+                'name' => $postal ? $r->text('contact:name', $postal) : '',
+                'org' => $postal ? $r->text('contact:org', $postal) : '',
+                'addr' => $addr,
+                'type' => $postal ? $postal->getAttribute('type') : '',
             ],
-
-            "voice" => isset($dList['contact:voice']) ? $dList['contact:voice'] : "",
-            "fax" => isset($dList['contact:fax']) ? $dList['contact:fax'] : "",
-            "email" => $dList['contact:email'],
-            "clID" => $dList['contact:clID'],
-            "crID" => $dList['contact:crID'],
-
-            "upID" => isset($dList['contact:upID']) ? $dList['contact:upID'] : "",
-            "upDate" => isset($dList['contact:upDate']) ? $dList['contact:upDate'] : "",
-            "crDate" => $dList['contact:crDate'],
-
-            "authInfo" => $dList['contact:authInfo']['contact:pw'],
-        ];
-
-        if (isset($addr['contact:street'])) {
-            $streetCount = 1;
-            if (is_array($addr['contact:street'])) {
-                foreach ($addr['contact:street'] as $svalue) {
-                    $result['postalInfo']['addr']['street' . $streetCount] = $svalue;
-                    $streetCount++;
-                }
-            } else {
-                $result['postalInfo']['addr']['street' . $streetCount] = $addr['contact:street'];
-            }
-        }
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "contact" => $result
-
-        ];
-        return $return;
+            'voice' => $r->text('contact:voice', $c),
+            'fax' => $r->text('contact:fax', $c),
+            'email' => $r->text('contact:email', $c),
+            'clID' => $r->text('contact:clID', $c),
+            'crID' => $r->text('contact:crID', $c),
+            'upID' => $r->text('contact:upID', $c),
+            'upDate' => $r->text('contact:upDate', $c),
+            'crDate' => $r->text('contact:crDate', $c),
+            'authInfo' => $r->text('contact:authInfo/contact:pw', $c),
+        ]]);
     }
 
-    public function domainContactInfo($domainName, $phoneDotRemove = false)
+    /**
+     * Contact details of a domain in WHMCS form:
+     * ['contents' => ['Registrant' => [...], 'Admin' => [...]], 'cId' => ['registrant' => id, ...], 'unqId' => [...]]
+     */
+    public function domainContactInfo($domainName)
     {
-        if (!is_string($domainName)) {
-            throw new exception('Invalid Domain Type.');
-        }
-
+        $this->assertDomain($domainName);
         $dInfo = $this->domainInfo($domainName);
 
         $contents = [];
-        $contents['registrant'] = $dInfo['domain']['registrant'];
-        foreach ($dInfo['domain']['contact'] as $dKey => $dValue) {
-            $contents[$dKey] = $dValue;
+        if ($dInfo['domain']['registrant'] !== '') {
+            $contents['registrant'] = $dInfo['domain']['registrant'];
+        }
+        foreach ($dInfo['domain']['contact'] as $type => $id) {
+            if ($id !== '') {
+                $contents[$type] = $id;
+            }
         }
 
-        //get contact data
-        $ucIds = array_unique(array_values($contents));
+        $ucIds = array_values(array_unique(array_values($contents)));
         $cidData = [];
-        foreach ($ucIds as $civalue) {
-            $contDt = $this->contactInfo($civalue);
-
-            $phoneNumber = ($contDt['contact']['voice'] ?? '');
-
-            $cf = [];
-            $cf["Full Name"] = $contDt['contact']['postalInfo']['name'];
-            $cf["Email"] = $contDt['contact']['email'];
-
-            $cf["Company Name"] = ($contDt['contact']['postalInfo']['org'] ?? '');
-
-
-            $cf["Address 1"] = ($contDt['contact']['postalInfo']['addr']['street1'] ?? '');
-            $cf["Address 2"] = ($contDt['contact']['postalInfo']['addr']['street2'] ?? '');
-
-            if (!empty($contDt['contact']['postalInfo']['addr']['street3'])) {
-                $cf["Address 3"] = $contDt['contact']['postalInfo']['addr']['street3'];
+        foreach ($ucIds as $cid) {
+            $c = $this->contactInfo($cid)['contact'];
+            $cf = [
+                'Full Name' => $c['postalInfo']['name'],
+                'Email' => $c['email'],
+                'Company Name' => $c['postalInfo']['org'],
+                'Address 1' => $c['postalInfo']['addr']['street1'] ?? '',
+                'Address 2' => $c['postalInfo']['addr']['street2'] ?? '',
+            ];
+            if (!empty($c['postalInfo']['addr']['street3'])) {
+                $cf['Address 3'] = $c['postalInfo']['addr']['street3'];
             }
-
-            $cf["City"] = $contDt['contact']['postalInfo']['addr']['city'];
-            $cf["State"] = $contDt['contact']['postalInfo']['addr']['state'];
-            $cf["Postcode"] = $contDt['contact']['postalInfo']['addr']['postal'];
-            $cf["Country"] = $contDt['contact']['postalInfo']['addr']['country'];
-
-            $cf["Phone Number"] = $phoneDotRemove === true ? str_replace(".", "", $phoneNumber) : $phoneNumber;
-            $cidData[$civalue] = $cf;
+            $cf['City'] = $c['postalInfo']['addr']['city'];
+            $cf['State'] = $c['postalInfo']['addr']['state'];
+            $cf['Postcode'] = $c['postalInfo']['addr']['postal'];
+            $cf['Country'] = $c['postalInfo']['addr']['country'];
+            // Shown exactly as stored (+CC.NUMBER) so a save sends a valid number back.
+            $cf['Phone Number'] = $c['voice'];
+            $cidData[$cid] = $cf;
         }
 
         $cccData = [];
-        foreach ($contents as $ccType => $ccId) {
-            $cccData[ucfirst($ccType)] = $cidData[$ccId];
+        foreach ($contents as $type => $cid) {
+            $cccData[ucfirst($type)] = $cidData[$cid];
         }
-
-        return ["contents" => $cccData, "cId" => $contents, "unqId" => $ucIds];
+        return ['contents' => $cccData, 'cId' => $contents, 'unqId' => $ucIds];
     }
 
-    //Contact Create
-    public function contactCreate($contactIdentifier, $params)
+    /**
+     * Validates and normalises WHMCS-style contact params into escaped
+     * template values. Required: name, address1, city, country, email.
+     */
+    protected function contactValues(array $params)
     {
-        if (!is_string($contactIdentifier) || !is_array(($params))) {
-            throw new exception('Invalid Contact Type.');
+        $get = function ($key) use ($params) {
+            return isset($params[$key]) && is_scalar($params[$key]) ? trim((string) $params[$key]) : '';
+        };
+
+        $name = trim(preg_replace('/\s+/', ' ', $get('firstname') . ' ' . $get('lastname')));
+        $values = [
+            'name' => $name,
+            'org' => $get('companyname'),
+            'street1' => $get('address1'),
+            'street2' => $get('address2'),
+            'street3' => $get('address3'),
+            'city' => $get('city'),
+            'sp' => $get('state'),
+            'pc' => $get('postcode'),
+            'cc' => strtoupper($get('country')),
+            'email' => $get('email'),
+        ];
+        $labels = ['name' => 'name', 'street1' => 'address 1', 'city' => 'city', 'cc' => 'country', 'email' => 'email'];
+        foreach ($labels as $key => $label) {
+            if ($values[$key] === '') {
+                throw new EppException("Missing required contact field: {$label}");
+            }
+        }
+        if (!preg_match('/^[A-Z]{2}$/', $values['cc'])) {
+            throw new EppException("Invalid contact country code: {$values['cc']}");
         }
 
-        $this->setParams($params);
+        $cc = $get('phonecc') !== '' ? $get('phonecc') : $get('Phone Country Code');
+        $phone = $get('fullphonenumber') !== '' ? $get('fullphonenumber') : $get('phonenumber');
+        // <contact:voice> is optional (RFC 5733): an empty phone is omitted
+        // (on update: left unchanged at the registry).
+        $voice = $phone === '' ? '' : ok_epp_normalisePhone($phone, $cc, $values['cc']);
+        if ($phone !== '' && $voice === '') {
+            throw new EppException("Invalid phone number \"{$phone}\": use the international format +CC.NUMBER");
+        }
+        $values['voice'] = $voice;
+        $values['fax'] = $get('fax') === '' ? '' : ok_epp_normalisePhone($get('fax'), $cc, $values['cc']);
 
-        $from = $to = [];
-        $from[] = '/{{ type }}/';
-        $to[] = (isset($params['postalInfo_type']) ? htmlspecialchars($params['postalInfo_type']) : "int");
-        $from[] = '/{{ id }}/';
-        $to[] = strtoupper($contactIdentifier);
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($this->getParams('firstname') . ' ' . ($params['lastname'] ?? ''));
-        $from[] = '/{{ org }}/';
-        $to[] = htmlspecialchars($this->getParams('companyname'));
-        $from[] = '/{{ street1 }}/';
-        $to[] = htmlspecialchars($this->getParams('address1'));
-        $from[] = '/{{ street2 }}/';
-        $to[] = (isset($params['address2']) ? htmlspecialchars($this->getParams('address2')) : '');
-        $from[] = '/{{ street3 }}/';
-        $street3 = (isset($params['address3']) ? htmlspecialchars($this->getParams('address3')) : '');
-        $to[] = htmlspecialchars($street3);
-        $from[] = '/{{ city }}/';
-        $to[] = htmlspecialchars($this->getParams('city'));
-        $from[] = '/{{ state }}/';
-        $to[] = htmlspecialchars($this->getParams('state'));
-        $from[] = '/{{ postcode }}/';
-        $to[] = htmlspecialchars($this->getParams('postcode'));
-        $from[] = '/{{ country }}/';
-        $to[] = htmlspecialchars($this->getParams('country'));
-        $from[] = '/{{ phonenumber }}/';
-        $to[] = htmlspecialchars($this->getParams('fullphonenumber'));
-        $from[] = '/{{ fax }}/';
-        $to[] = (isset($params['fax']) ? htmlspecialchars($this->getParams('fax')) : "");
-        $from[] = '/{{ email }}/';
-        $to[] = htmlspecialchars($this->getParams('email'));
-        $from[] = '/{{ authInfo }}/';
-        $to[] = htmlspecialchars(ok_epp_generateObjectPW());
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-contact-create-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
+        $type = $get('postalInfo_type') !== '' ? $get('postalInfo_type') : $get('type');
+        $values['type'] = in_array($type, ['int', 'loc'], true) ? $type : 'int';
+        return $values;
+    }
 
-        $xml = preg_replace($from, $to, '<command>
-        <create>
-            <contact:create xmlns:contact="urn:ietf:params:xml:ns:contact-1.0">
-                <contact:id>{{ id }}</contact:id>
-                <contact:postalInfo type="{{ type }}">
-                    <contact:name>{{ name }}</contact:name>
-                    <contact:org>{{ org }}</contact:org>
-                    <contact:addr>
-                        <contact:street>{{ street1 }}</contact:street>
-                        <contact:street>{{ street2 }}</contact:street>
-                        <contact:street>{{ street3 }}</contact:street>
-                        <contact:city>{{ city }}</contact:city>
-                        <contact:sp>{{ state }}</contact:sp>
-                        <contact:pc>{{ postcode }}</contact:pc>
-                        <contact:cc>{{ country }}</contact:cc>
-                    </contact:addr>
-                </contact:postalInfo>
-                <contact:voice>{{ phonenumber }}</contact:voice>
-                <contact:fax>{{ fax }}</contact:fax>
-                <contact:email>{{ email }}</contact:email>
-                <contact:authInfo>
-                    <contact:pw>{{ authInfo }}</contact:pw>
-                </contact:authInfo>
-            </contact:create>
-        </create>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
+    const CONTACT_OPTIONAL = ['contact:org', 'contact:street', 'contact:sp', 'contact:pc', 'contact:voice', 'contact:fax'];
 
-        $r = $this->_write($xml, __FUNCTION__);
+    protected function postalInfoTemplate()
+    {
+        return '<contact:postalInfo type="{{ type }}">'
+            . '<contact:name>{{ name }}</contact:name>'
+            . '<contact:org>{{ org }}</contact:org>'
+            . '<contact:addr>'
+            . '<contact:street>{{ street1 }}</contact:street>'
+            . '<contact:street>{{ street2 }}</contact:street>'
+            . '<contact:street>{{ street3 }}</contact:street>'
+            . '<contact:city>{{ city }}</contact:city>'
+            . '<contact:sp>{{ sp }}</contact:sp>'
+            . '<contact:pc>{{ pc }}</contact:pc>'
+            . '<contact:cc>{{ cc }}</contact:cc>'
+            . '</contact:addr>'
+            . '</contact:postalInfo>'
+            . '<contact:voice>{{ voice }}</contact:voice>'
+            . '<contact:fax>{{ fax }}</contact:fax>'
+            . '<contact:email>{{ email }}</contact:email>';
+    }
 
-        $dList = $r['resData']['contact:creData'];
-        $result = [
-            "success" => true,
-            "id" => $dList['contact:id'],
-            "crDate" => $dList['contact:crDate'],
-        ];
+    protected function contactId($contactIdentifier)
+    {
+        $id = strtoupper(trim((string) $contactIdentifier));
+        if (!preg_match('/^\S{3,16}$/', $id)) {
+            throw new EppException("Invalid contact ID: {$contactIdentifier}");
+        }
+        return $id;
+    }
 
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "contact" => $result
+    public function contactCreate($contactIdentifier, $params)
+    {
+        if (!is_string($contactIdentifier) || !is_array($params)) {
+            throw new EppException('Invalid Contact Type.');
+        }
+        $values = $this->contactValues($params);
+        $values['id'] = $this->contactId($contactIdentifier);
+        $values['authInfo'] = ok_epp_generateObjectPW();
 
-        ];
-        return $return;
+        $xml = $this->render('contact-create', '<command><create>'
+            . '<contact:create xmlns:contact="' . self::NS_CONTACT . '">'
+            . '<contact:id>{{ id }}</contact:id>'
+            . $this->postalInfoTemplate()
+            . '<contact:authInfo><contact:pw>{{ authInfo }}</contact:pw></contact:authInfo>'
+            . '</contact:create></create><clTRID>{{ clTRID }}</clTRID></command>', $values, [], self::CONTACT_OPTIONAL);
+
+        $r = $this->request($xml, __FUNCTION__);
+        $cre = $r->node('//contact:creData');
+        return array_merge($r->meta(), ['contact' => [
+            'success' => true,
+            'id' => $cre ? $r->text('contact:id', $cre) : $values['id'],
+            'crDate' => $cre ? $r->text('contact:crDate', $cre) : '',
+        ]]);
     }
 
     public function contactDelete($contactIdentifier)
     {
-        if (!is_string($contactIdentifier)) {
-            throw new exception('Invalid contact type');
+        if (!is_string($contactIdentifier) || trim($contactIdentifier) === '') {
+            throw new EppException('Invalid contact type');
         }
+        $xml = $this->render('contact-delete', '<command><delete>'
+            . '<contact:delete xmlns:contact="' . self::NS_CONTACT . '"><contact:id>{{ id }}</contact:id></contact:delete>'
+            . '</delete><clTRID>{{ clTRID }}</clTRID></command>', ['id' => $contactIdentifier]);
 
-        $from = $to = [];
-        $from[] = '/{{ id }}/';
-        $to[] = htmlspecialchars($contactIdentifier);
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-contact-delete-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-    <delete>
-        <contact:delete
-            xmlns:contact="urn:ietf:params:xml:ns:contact-1.0">
-            <contact:id>{{ id }}</contact:id>
-        </contact:delete>
-    </delete>
-    <clTRID>{{ clTRID }}</clTRID>
-</command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "contact" => [
-                "success" => true,
-                "id" => $contactIdentifier,
-                "msg" => "Contact Deleted"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['contact' => ['success' => true, 'id' => $contactIdentifier, 'msg' => 'Contact Deleted']]);
     }
 
-    //contact Update and chg
     public function contactUpdate($contactIdentifier, $params)
     {
-        if (!is_string($contactIdentifier)) {
-            throw new exception('Invalid contact type');
+        if (!is_string($contactIdentifier) || trim($contactIdentifier) === '' || !is_array($params)) {
+            throw new EppException('Invalid contact type');
         }
+        $values = $this->contactValues($params);
+        $values['id'] = $contactIdentifier;
 
-        if (!isset($params['type'])) {
-            $params['type'] = 'int';
-        }
+        $xml = $this->render('contact-update', '<command><update>'
+            . '<contact:update xmlns:contact="' . self::NS_CONTACT . '">'
+            . '<contact:id>{{ id }}</contact:id>'
+            . '<contact:chg>' . $this->postalInfoTemplate() . '</contact:chg>'
+            . '</contact:update></update><clTRID>{{ clTRID }}</clTRID></command>', $values, [], self::CONTACT_OPTIONAL);
 
-        $this->setParams($params);
-
-        $from = $to = [];
-        $from[] = '/{{ type }}/';
-        $to[] = htmlspecialchars($this->getParams('type'));
-        $from[] = '/{{ id }}/';
-        $to[] = htmlspecialchars($contactIdentifier);
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($this->getParams('firstname') . ' ' . ($params['lastname'] ?? ''));
-        $from[] = '/{{ org }}/';
-        $to[] = htmlspecialchars($this->getParams('companyname'));
-        $from[] = '/{{ street1 }}/';
-        $to[] = htmlspecialchars($this->getParams('address1'));
-        $from[] = '/{{ street2 }}/';
-        $to[] = (isset($params['address2']) ? htmlspecialchars($this->getParams('address2')) : '');
-        $from[] = '/{{ street3 }}/';
-        $street3 = (!empty($params['address3']) ? htmlspecialchars($this->getParams('address3')) : '');
-        $to[] = htmlspecialchars($street3);
-        $from[] = '/{{ city }}/';
-        $to[] = htmlspecialchars($this->getParams('city'));
-        $from[] = '/{{ state }}/';
-        $to[] = htmlspecialchars($this->getParams('state'));
-        $from[] = '/{{ postcode }}/';
-        $to[] = htmlspecialchars($this->getParams('postcode'));
-        $from[] = '/{{ country }}/';
-        $to[] = htmlspecialchars($this->getParams('country'));
-        $from[] = '/{{ voice }}/';
-        $to[] = htmlspecialchars($this->getParams('fullphonenumber'));
-        $from[] = '/{{ fax }}/';
-        $to[] = (isset($params['fax']) && preg_match('/^(\+[0-9]{1,3}\.[0-9]{1,14})?$/', $params['fax']) ? htmlspecialchars($this->getParams('fax')) : '');
-        $from[] = '/{{ email }}/';
-        $to[] = htmlspecialchars($this->getParams('email'));
-        $from[] = '/{{ clTRID }}/';
-
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-contact-update-' . $clTRID);
-
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-        $xml = preg_replace($from, $to, '<command>
-	<update>
-	  <contact:update xmlns:contact="urn:ietf:params:xml:ns:contact-1.0" xsi:schemaLocation="urn:ietf:params:xml:ns:contact-1.0 contact-1.0.xsd">
-		<contact:id>{{ id }}</contact:id>
-		<contact:chg>
-		  <contact:postalInfo type="{{ type }}">
-			<contact:name>{{ name }}</contact:name>
-			<contact:org>{{ org }}</contact:org>
-			<contact:addr>
-			  <contact:street>{{ street1 }}</contact:street>
-			  <contact:street>{{ street2 }}</contact:street>
-			  <contact:street>{{ street3 }}</contact:street>
-			  <contact:city>{{ city }}</contact:city>
-			  <contact:sp>{{ state }}</contact:sp>
-			  <contact:pc>{{ postcode }}</contact:pc>
-			  <contact:cc>{{ country }}</contact:cc>
-			</contact:addr>
-		  </contact:postalInfo>
-		  <contact:voice>{{ voice }}</contact:voice>
-		  <contact:fax>{{ fax }}</contact:fax>
-		  <contact:email>{{ email }}</contact:email>
-		</contact:chg>
-	  </contact:update>
-	</update>
-	<clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "contact" => [
-                "success" => true,
-                "id" => $contactIdentifier,
-                "msg" => "Contact Updated"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['contact' => ['success' => true, 'id' => $contactIdentifier, 'msg' => 'Contact Updated']]);
     }
 
-    /**
-     * @param string $contactIdentifier
-     * @param int $protectenable 1 or 0
-     *
-     * @return array
-     */
-    public function contactUpdateProtect($contactIdentifier, $protectenable = 1)
-    {
-        if (!is_string($contactIdentifier)) {
-            throw new exception('Invalid Contact Type.');
-        }
-
-        $from = $to = [];
-        $from[] = '/{{ id }}/';
-        $to[] = htmlspecialchars($contactIdentifier);
-
-        $from[] = '/{{ flag }}/';
-        $to[] = ($protectenable ? 1 : 0);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-contact-updateProtect-' . $clTRID);
-
-        $xml = preg_replace($from, $to, '<command>
-	<update>
-	  <contact:update xmlns:contact="urn:ietf:params:xml:ns:contact-1.0" xsi:schemaLocation="urn:ietf:params:xml:ns:contact-1.0 contact-1.0.xsd">
-		<contact:id>{{ id }}</contact:id>
-		<contact:chg>
-          <contact:disclose flag="{{ flag }}">
-			<contact:name type="int"/>
-			<contact:addr type="int"/>
-			<contact:voice/>
-			<contact:fax/>
-			<contact:email/>
-          </contact:disclose>
-		</contact:chg>
-	  </contact:update>
-	</update>
-	<clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "contact" => [
-                "success" => true,
-                "id" => $contactIdentifier,
-                "msg" => "Contact Updated"
-            ]
-
-        ];
-        return $return;
-    }
+    // ------------------------------------------------------------------
+    // Host (RFC 5732)
+    // ------------------------------------------------------------------
 
     public function hostCheck($hostNames)
     {
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = ok_epp_simple_ArrStrTag($hostNames, "host:name");
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-host-check-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-    <check>
-        <host:check
-            xmlns:host="urn:ietf:params:xml:ns:host-1.0"
-            xsi:schemaLocation="urn:ietf:params:xml:ns:host-1.0 host-1.0.xsd">
-            {{ name }}
-        </host:check>
-    </check>
-    <clTRID>{{ clTRID }}</clTRID>
-</command>');
+        $names = $this->tags('host:name', $hostNames);
+        if ($names === '') {
+            throw new EppException('No host name to check');
+        }
+        $xml = $this->render('host-check', '<command><check>'
+            . '<host:check xmlns:host="' . self::NS_HOST . '">{{ names }}</host:check>'
+            . '</check><clTRID>{{ clTRID }}</clTRID></command>', [], ['names' => $names]);
 
-        $r = $this->_write($xml, __FUNCTION__);
+        $r = $this->request($xml, __FUNCTION__);
         $result = [];
-        foreach (ok_epp_arr2arr($r['resData']['host:chkData']['host:cd']) as $dList) {
+        foreach ($r->nodes('//host:chkData/host:cd') as $cd) {
             $result[] = [
-                "name" => $dList['host:name'],
-                "avail" => $dList['host:name_attr']['avail'],
-                "reason" => isset($dList['host:reason']) ? $dList['host:reason'] : "",
+                'name' => $r->text('host:name', $cd),
+                'avail' => ok_epp_bool($r->attr('host:name', 'avail', $cd, '0')),
+                'reason' => $r->text('host:reason', $cd),
             ];
         }
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "host" => $result
-
-        ];
-        return $return;
+        return array_merge($r->meta(), ['host' => $result]);
     }
 
     public function hostInfo($hostName)
     {
-        if (!is_string($hostName)) {
-            throw new exception('Invalid Host type');
+        if (!is_string($hostName) || trim($hostName) === '') {
+            throw new EppException('Invalid Host type');
         }
+        $xml = $this->render('host-info', '<command><info>'
+            . '<host:info xmlns:host="' . self::NS_HOST . '"><host:name>{{ name }}</host:name></host:info>'
+            . '</info><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $hostName]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = $hostName;
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-host-info-' . $clTRID);
-
-        $xml = preg_replace($from, $to, '<command>
-        <info>
-            <host:info
-                xmlns:host="urn:ietf:params:xml:ns:host-1.0">
-                <host:name>{{ name }}</host:name>
-            </host:info>
-        </info>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['host:infData'];
-
-        if (empty($dList['host:status'])) {
-            $dStatus = [$dList['host:status_attr']['s']];
-        } else {
-            $dStatus = [];
-            foreach ($dList['host:status'] as $dStatusc) {
-                if (isset($dStatusc['s'])) {
-                    $dStatus[] = $dStatusc['s'];
-                }
+        $r = $this->request($xml, __FUNCTION__);
+        $h = $r->node('//host:infData');
+        if ($h === null) {
+            throw new EppException('Registry response has no host information');
+        }
+        $status = [];
+        foreach ($r->nodes('host:status', $h) as $node) {
+            if ($node->getAttribute('s') !== '') {
+                $status[] = $node->getAttribute('s');
             }
         }
-
-        $addr = [];
-        if (isset($dList['host:addr'])) {
-            if (isset($dList['host:addr_attr'])) {
-                $addr[] = $dList['host:addr'];
-            } else {
-                foreach ($dList['host:addr'] as $ipd) {
-                    if (is_string($ipd)) {
-                        $addr[] = $ipd;
-                    }
-                }
-            }
-        }
-
-        $result = [
-            "name" => $dList['host:name'],
-            "roid" => $dList['host:roid'],
-            "status" => $dStatus,
-            'addr' => $addr,
-            "clID" => $dList['host:clID'],
-            "crID" => $dList['host:crID'],
-            "crDate" => $dList['host:crDate'],
-            "upID" => isset($dList['host:upID']) ? $dList['host:upID'] : "",
-            "upDate" => isset($dList['host:upDate']) ? $dList['host:upDate'] : "",
-        ];
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "host" => $result
-
-        ];
-        return $return;
+        return array_merge($r->meta(), ['host' => [
+            'name' => $r->text('host:name', $h),
+            'roid' => $r->text('host:roid', $h),
+            'status' => $status,
+            'addr' => $r->texts('host:addr', $h),
+            'clID' => $r->text('host:clID', $h),
+            'crID' => $r->text('host:crID', $h),
+            'crDate' => $r->text('host:crDate', $h),
+            'upID' => $r->text('host:upID', $h),
+            'upDate' => $r->text('host:upDate', $h),
+        ]]);
     }
 
-    // $ips -> when we create "Private nameserver" and it's only for same registrar registered domain
+    /** $ips: glue addresses, only for hosts under a domain of this registry. */
     public function hostCreate($hostName, $ips = null)
     {
-        if (!is_string($hostName)) {
-            throw new exception('Invalid Host type');
+        if (!is_string($hostName) || trim($hostName) === '') {
+            throw new EppException('Invalid Host type');
         }
+        $xml = $this->render('host-create', '<command><create>'
+            . '<host:create xmlns:host="' . self::NS_HOST . '"><host:name>{{ name }}</host:name>{{ ip }}</host:create>'
+            . '</create><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $hostName], ['ip' => ok_epp_simple_IpsArrStrTag($ips, 'host:addr')]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($hostName);
-        $from[] = '/{{ ip }}/';
-        $to[] = ok_epp_simple_IpsArrStrTag($ips, "host:addr");
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-host-create-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-	<create>
-	  <host:create
-	   xmlns:host="urn:ietf:params:xml:ns:host-1.0">
-		<host:name>{{ name }}</host:name>
-		{{ ip }}
-	  </host:create>
-	</create>
-	<clTRID>{{ clTRID }}</clTRID>
-  </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $dList = $r['resData']['host:creData'];
-        $result = [
-            "success" => true,
-            "name" => $dList['host:name'],
-            "crDate" => $dList['host:crDate'],
-        ];
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "host" => $result
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        $cre = $r->node('//host:creData');
+        return array_merge($r->meta(), ['host' => [
+            'success' => true,
+            'name' => $cre ? $r->text('host:name', $cre) : $hostName,
+            'crDate' => $cre ? $r->text('host:crDate', $cre) : '',
+        ]]);
     }
 
     public function hostDelete($hostName)
     {
-        if (!is_string($hostName)) {
-            throw new exception('Invalid Host type');
+        if (!is_string($hostName) || trim($hostName) === '') {
+            throw new EppException('Invalid Host type');
         }
+        $xml = $this->render('host-delete', '<command><delete>'
+            . '<host:delete xmlns:host="' . self::NS_HOST . '"><host:name>{{ name }}</host:name></host:delete>'
+            . '</delete><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $hostName]);
 
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($hostName);
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-host-delete-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <delete>
-            <host:delete
-                xmlns:host="urn:ietf:params:xml:ns:host-1.0">
-                <host:name>{{ name }}</host:name>
-            </host:delete>
-        </delete>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "host" => [
-                "success" => true,
-                "name" => $hostName,
-                "msg" => "Host Deleted"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['host' => ['success' => true, 'name' => $hostName, 'msg' => 'Host Deleted']]);
     }
 
     public function hostUpdate($hostName, $addIps = null, $remIps = null)
     {
-        if (!is_string($hostName)) {
-            throw new exception('Invalid Host type');
+        if (!is_string($hostName) || trim($hostName) === '') {
+            throw new EppException('Invalid Host type');
         }
+        $add = ok_epp_simple_IpsArrStrTag($addIps, 'host:addr');
+        $rem = ok_epp_simple_IpsArrStrTag($remIps, 'host:addr');
+        if ($add === '' && $rem === '') {
+            return $this->noChange('host', $hostName, 'Host unchanged');
+        }
+        $xml = $this->render('host-update', '<command><update>'
+            . '<host:update xmlns:host="' . self::NS_HOST . '"><host:name>{{ name }}</host:name>{{ add }}{{ rem }}</host:update>'
+            . '</update><clTRID>{{ clTRID }}</clTRID></command>', ['name' => $hostName], [
+            'add' => $add === '' ? '' : '<host:add>' . $add . '</host:add>',
+            'rem' => $rem === '' ? '' : '<host:rem>' . $rem . '</host:rem>',
+        ]);
 
-        $addIpsXML = ok_epp_simple_IpsArrStrTag($addIps, "host:addr");
-        $remIpsXML = ok_epp_simple_IpsArrStrTag($remIps, "host:addr");
-
-        $from = $to = [];
-        $from[] = '/{{ name }}/';
-        $to[] = htmlspecialchars($hostName);
-
-        $from[] = '/{{ addIp }}/';
-        $to[] = !empty($addIpsXML) ? '<host:add>' . $addIpsXML . '</host:add>' : "";
-
-        $from[] = '/{{ remIp }}/';
-        $to[] = !empty($remIpsXML) ? '<host:rem>' . $remIpsXML . '</host:rem>' : "";
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-host-update-' . $clTRID);
-        $xml = preg_replace($from, $to, '<command>
-        <update>
-            <host:update
-                xmlns:host="urn:ietf:params:xml:ns:host-1.0">
-                <host:name>{{ name }}</host:name>
-                {{ addIp }}
-                {{ remIp }}
-            </host:update>
-        </update>
-        <clTRID>{{ clTRID }}</clTRID>
-    </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "host" => [
-                "success" => true,
-                "name" => $hostName,
-                "msg" => "Host Updated"
-            ]
-
-        ];
-        return $return;
+        $r = $this->request($xml, __FUNCTION__);
+        return array_merge($r->meta(), ['host' => ['success' => true, 'name' => $hostName, 'msg' => 'Host Updated']]);
     }
+
+    // ------------------------------------------------------------------
+    // Poll (RFC 5730)
+    // ------------------------------------------------------------------
 
     public function pollReq()
     {
-        $from = $to = [];
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-poll-req-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-        $xml = preg_replace($from, $to, '<command>
-       <poll op="req"/>
-       <clTRID>{{ clTRID }}</clTRID>
-     </command>');
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-            "poll" => [
-                "qDate" => ($r['msgQ']['qDate'] ?? ""),
-                "msg" => ($r['msgQ']['msg'] ?? ""),
-                "msg_last_id" => ($r['msgQ_attr']['id'] ?? ""),
-                "msg_count" => ($r['msgQ_attr']['count'] ?? "")
-            ]
-        ];
-        return $return;
+        $xml = $this->render('poll-req', '<command><poll op="req"/><clTRID>{{ clTRID }}</clTRID></command>');
+        $r = $this->request($xml, __FUNCTION__);
+        $q = $r->node('//epp:response/epp:msgQ');
+        return array_merge($r->meta(), ['poll' => [
+            'qDate' => $q ? $r->text('epp:qDate', $q) : '',
+            'msg' => $q ? $r->text('epp:msg', $q) : '',
+            'msg_last_id' => $q ? $q->getAttribute('id') : '',
+            'msg_count' => $q ? $q->getAttribute('count') : '',
+        ]]);
     }
 
     public function pollAck($msgID)
     {
-        $from = $to = [];
-        $from[] = '/{{ message }}/';
-        $to[] = htmlspecialchars($msgID);
-
-        $from[] = '/{{ clTRID }}/';
-        $clTRID = str_replace('.', '', round(microtime(1), 3));
-        $to[] = htmlspecialchars($this->getConfig("identityprefix") . '-poll-ack-' . $clTRID);
-        $from[] = "/<\w+:\w+>\s*<\/\w+:\w+>\s+/ims";
-        $to[] = '';
-
-        $xml = preg_replace($from, $to, '<command>
-       <poll op="ack" msgID="{{ message }}"/>
-       <clTRID>{{ clTRID }}</clTRID>
-     </command>');
-
-        $r = $this->_write($xml, __FUNCTION__);
-
-        $return = [
-            "code" => $r['result_attr']['code'],
-            "msg" => $r['result']['msg'],
-            "lang" => $r['result']['msg_attr']['lang'],
-
-
-        ];
-        return $return;
+        if (trim((string) $msgID) === '') {
+            throw new EppException('Empty poll message ID');
+        }
+        $xml = $this->render('poll-ack', '<command><poll op="ack" msgID="{{ message }}"/><clTRID>{{ clTRID }}</clTRID></command>', ['message' => $msgID]);
+        $r = $this->request($xml, __FUNCTION__);
+        return $r->meta();
     }
-
-
-    //class end
 }

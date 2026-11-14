@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest something the module should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need?
+      description: The WHMCS action or registry feature, and why you need it
+    validations:
+      required: true
+  - type: textarea
+    id: registry
+    attributes:
+      label: Registry documentation
+      description: A link to, or a quote from, the registry documentation that describes the feature, if you have one

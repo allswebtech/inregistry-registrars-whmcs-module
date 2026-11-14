@@ -2,15 +2,16 @@
   "schema": "1.0",
   "type": "whmcs-registrars",
   "name": "inregistry",
-  "license": "proprietary",
+  "license": "MIT",
+  "version": "2.0.0",
   "category": "domains",
   "description": {
     "name": "IN Registry",
-    "tagline": "Unofficially .in domain name registry WHMCS module.",
+    "tagline": "Unofficial WHMCS registrar module for .IN domains (NIXI .IN Registry, EPP)",
     "features": [
       "Automated Domain Registrations, Transfers & Renewals",
       "Ability to View/Change Nameservers & WHOIS Info",
-      "Domain Locking, ID Protection, EPP Code Retrieval",
+      "Domain Locking, EPP Code Retrieval",
       "Register/Manage Private Nameservers"
     ]
   },
@@ -18,12 +19,12 @@
     "filename": "logo.gif"
   },
   "support": {
-    "docs_url": "https:\/\/www.registry.in\/"
+    "docs_url": "https:\/\/github.com\/allswebtech\/inregistry-registrars-whmcs-module"
   },
   "authors": [
     {
-      "name": "IN Registry",
-      "homepage": "https:\/\/www.registry.in\/"
+      "name": "AllsWeb",
+      "homepage": "https:\/\/www.allsweb.com"
     }
   ]
 }
